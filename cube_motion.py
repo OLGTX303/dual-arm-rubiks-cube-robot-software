@@ -299,6 +299,7 @@ def cmd_zero(ser):
     cmd_trap(ser, [1, 2], False, [[finger1_pos, 0, speed_fast, accel, MAX_CURRENT], 
                                   [arm2_zero, 0, speed_fast*2, accel*2, MAX_CURRENT]])
     cmd_wait_motion(ser, 2)
+    cmd_wait_motion(ser, 1)
     arm2_pos = arm2_zero
 
     # 手指3回零点
@@ -322,6 +323,7 @@ def cmd_zero(ser):
     cmd_trap(ser, [3, 4], False, [[finger3_pos, 0, speed_fast, accel, MAX_CURRENT], 
                                   [arm4_zero, 0, speed_fast*2, accel*2, MAX_CURRENT]])
     cmd_wait_motion(ser, 4)
+    cmd_wait_motion(ser, 3)
     arm4_pos = arm4_zero
     logger.info(f"finger1_pos={finger1_pos}")
     logger.info(f"arm2_pos={arm2_pos}")
@@ -377,6 +379,7 @@ class MotionCtrl:
         cmd_trap(self.ser, [1, 3], False, 
                  [[finger1, 0, V_FINGER, A_FINGER, current], 
                   [finger3, 0, V_FINGER, A_FINGER, current]])
+        cmd_wait_motion(self.ser, 1)
         cmd_wait_motion(self.ser, 3)
 
     def two_finger_init(self):
