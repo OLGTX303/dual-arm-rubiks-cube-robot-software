@@ -109,13 +109,14 @@ def do_hw(cmd):
                 elif cmd=='go_home': result=legacy.cmd_zero(s) is not None
                 elif cmd in ('release_cube','clamp_cube'):
                     # Reuse the original open/close spacing, but apply only
-                    # that small difference from the current finger position.
-                    # Do not home/full-open the fingers and do not move arms.
+                    # that small difference from the current positions.
+                    # Keep the original arm/finger mechanical coupling.
                     distance = legacy.FINGER_INIT - legacy.FINGER_CLAMP
                     if cmd == 'clamp_cube': distance = -distance
-                    legacy.move_fingers_relative(s, distance,
-                                                  legacy.MAX_CURRENT if cmd == 'release_cube'
-                                                  else legacy.CLAMP_CURRENT)
+                    legacy.move_fingers_and_arms_relative(
+                        s, distance,
+                        legacy.MAX_CURRENT if cmd == 'release_cube'
+                        else legacy.CLAMP_CURRENT)
                     result=True
                 elif cmd.startswith('motions:'):
                     seq=cmd.split(':',1)[1].strip().split(); p=legacy.cmd_zero(s)

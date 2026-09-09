@@ -332,16 +332,27 @@ def cmd_zero(ser):
     
     return (finger1_pos, arm2_pos, finger3_pos, arm4_pos)
 
-def move_fingers_relative(ser, distance, current):
-    """Move both fingers a small distance; never home or command the arms."""
+def move_fingers_and_arms_relative(ser, distance, finger_current):
+    """Move both finger/arm pairs a small, synchronized distance.
+
+    The arms use the opposite logical sign in the calibration and a 2:1
+    reduction, so -2 * distance gives the same physical CW/CCW direction.
+    """
     finger1 = cmd_get_pos(ser, 1)
+    arm2 = cmd_get_pos(ser, 2)
     finger3 = cmd_get_pos(ser, 3)
-    cmd_enable(ser, [1, 3], True)
-    cmd_trap(ser, [1, 3], False,
-             [[finger1 + distance, 0, V_FINGER, A_FINGER, current],
-              [finger3 + distance, 0, V_FINGER, A_FINGER, current]])
+    arm4 = cmd_get_pos(ser, 4)
+    arm_distance = -2 * distance
+    cmd_enable(ser, [1, 2, 3, 4], True)
+    cmd_trap(ser, [1, 2, 3, 4], False,
+             [[finger1 + distance, 0, V_FINGER, A_FINGER, finger_current],
+              [arm2 + arm_distance, 0, 2 * V_FINGER, 2 * A_FINGER, MAX_CURRENT],
+              [finger3 + distance, 0, V_FINGER, A_FINGER, finger_current],
+              [arm4 + arm_distance, 0, 2 * V_FINGER, 2 * A_FINGER, MAX_CURRENT]])
     cmd_wait_motion(ser, 1)
+    cmd_wait_motion(ser, 2)
     cmd_wait_motion(ser, 3)
+    cmd_wait_motion(ser, 4)
 
 # ------------------------------- 以下是运动控制代码 -------------------------------
 LEFT          = True
