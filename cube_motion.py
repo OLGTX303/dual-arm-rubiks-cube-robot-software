@@ -1,1267 +1,716 @@
-#!/usr/bin/env python3
-"""Direct EMM-V5 TTL motion backend for the dual-arm Rubik's-cube robot.
-
-This file is a drop-in replacement for ``software/cube_motion.py``.
-
-Connection
-----------
-PC / Linux -> USB-TTL adapter -> shared EMM-V5 TTL bus -> motor IDs 1..4
-
-There is no intermediate controller protocol. Every motor command in this file
-is a native EMM-V5 frame ending in 0x6B. Synchronized moves are queued with the
-native 0xFD sync flag and started with the native broadcast::
-
-    00 FF 66 6B
-
-Physical motor mapping used by my_codev1.2 / ttl_build:
-    1 = right arm
-    2 = right finger
-    3 = left arm
-    4 = left finger
-
-The public API used by the existing software is preserved:
-    DEFAULT_SERIAL_PORT
-    BAUD_RATE
-    cmd_zero(ser)
-    cmd_enable(ser, ids, enable)
-    cmd_stat(ser, id)
-    cmd_get_pos(ser, id)
-    cmd_wait_motion(ser, id)
-    MotionCtrl(ser, *cmd_zero(...))
-    MotionCtrl.two_finger_init()
-    MotionCtrl.two_finger_clamp()
-    MotionCtrl.motions(...)
-
-IMPORTANT
----------
-``cmd_zero`` does not drive into an end stop. It records the current encoder
-positions in the PC as the safe reference, matching the v1.2 workflow. Before
-starting, mechanically place both arms at the known horizontal/reference pose
-and the fingers at the normal clamped pose.
-
-Clamp overflow protection is built in. After a clamp the arm encoders are
-checked against the planned cube orientation. Excess grip-induced rotation is
-recovered automatically with a softer adaptive clamp and closed-loop native
-TTL arm/finger correction moves.
-"""
-
-from __future__ import annotations
-
-import logging
-import os
-import sys
-import threading
-import time
-from dataclasses import dataclass
-from typing import Iterable, Sequence
-
 import serial
+import struct
+import time
+import logging
+import sys
 from serial.tools import list_ports
 
-
-# ---------------------------------------------------------------------------
-# Bus / motor configuration
-# ---------------------------------------------------------------------------
-
-DEFAULT_SERIAL_PORT = os.environ.get("CUBE_ROBOT_PORT", "/dev/ttyUSB0")
-BAUD_RATE = int(os.environ.get("CUBE_ROBOT_BAUD", "115200"))
-CHECKSUM = 0x6B
-
-RIGHT_ARM_ID = 1
-RIGHT_FINGER_ID = 2
-LEFT_ARM_ID = 3
-LEFT_FINGER_ID = 4
-MOTOR_IDS = (RIGHT_ARM_ID, RIGHT_FINGER_ID, LEFT_ARM_ID, LEFT_FINGER_ID)
-FINGER_IDS = (RIGHT_FINGER_ID, LEFT_FINGER_ID)
-ARM_IDS = (RIGHT_ARM_ID, LEFT_ARM_ID)
-
-RIGHT = False
-LEFT = True
-CW = True
-CCW = False
-
-# The assembled right arm has the native motor direction reversed relative to
-# the robot's logical encoder-positive direction. This is the same mapping as
-# motor_config.h in ttl_build.
-RIGHT_ARM_DIRECTION_INVERT = False
-# The right drive needs inverted command direction, but its encoder already reports the robot logical sign.
-RIGHT_ARM_FEEDBACK_INVERT = True
-LEFT_ARM_DIRECTION_INVERT = False
-
-# Native position-command calibration used by ttl_build / my_codev1.2.
-ARM_90_PULSES = 1600
-FINGER_LIMIT_PULSES = 1600
-FINGER_CLAMP_ABS = 160
-FINGER_RELEASE_ABS = 220
-FINGER_NO_LOAD_ABS = 1400
-
-# cmd_zero records the current normal clamp as host coordinate zero.
-JAW_CLAMP = 0
-JAW_RELEASE = FINGER_RELEASE_ABS - FINGER_CLAMP_ABS       # +60
-JAW_NO_LOAD = FINGER_NO_LOAD_ABS - FINGER_CLAMP_ABS      # +1240
-JAW_MAX_FROM_CLAMP = FINGER_LIMIT_PULSES - FINGER_CLAMP_ABS  # +1440
-
-# Finger motor pose includes jaw opening + signed arm/2 belt compensation.
-BELT_FINGER_MAX_PULSES = 6400
-POSITION_TOLERANCE_PULSES = 90
-ARM_V_COLLISION_GAP_PULSES = 160
-
-# Clamp-overflow recovery. A hard jaw clamp can mechanically drag an arm a
-# number of degrees away from the planned cube orientation. Detect that encoder
-# drift after every clamp, soften the grip a little, then return the arm to its
-# planned position with native synchronized TTL moves.
-ARM_PULSES_PER_DEG = ARM_90_PULSES / 90.0
-CLAMP_OVERFLOW_TRIGGER_DEG = float(os.environ.get("CUBE_CLAMP_OVERFLOW_DEG", "4.0"))
-CLAMP_OVERFLOW_SETTLE_DEG = float(os.environ.get("CUBE_CLAMP_SETTLE_DEG", "1.5"))
-CLAMP_OVERFLOW_MAX_DEG = float(os.environ.get("CUBE_CLAMP_OVERFLOW_MAX_DEG", "70.0"))
-CLAMP_RECOVERY_STEP_DEG = float(os.environ.get("CUBE_CLAMP_RECOVERY_STEP_DEG", "30.0"))
-CLAMP_RECOVERY_BACKOFF_PULSES = int(os.environ.get("CUBE_CLAMP_BACKOFF_PULSES", "25"))
-CLAMP_SOFT_MAX_PULSES = int(os.environ.get("CUBE_CLAMP_SOFT_MAX_PULSES", "45"))
-CLAMP_RECOVERY_RPM = int(os.environ.get("CUBE_CLAMP_RECOVERY_RPM", "220"))
-CLAMP_RECOVERY_ACCEL = int(os.environ.get("CUBE_CLAMP_RECOVERY_ACCEL", "160"))
-CLAMP_RECOVERY_ATTEMPTS = int(os.environ.get("CUBE_CLAMP_RECOVERY_ATTEMPTS", "4"))
-CLAMP_SETTLE_SECONDS = float(os.environ.get("CUBE_CLAMP_SETTLE_SECONDS", "0.06"))
-
-# Realtime encoder frame 0x36 uses 65536 counts/rev. The position command uses
-# 3200 pulses/rev (200 full steps * 16 microsteps).
-ENCODER_COUNTS_PER_REV = 65536.0
-MOTOR_PULSES_PER_REV = 3200.0
-
-# Native EMM-V5 position acceleration values used by the firmware. The finger
-# ramp is half the arm ramp in time so the 2:1 belt relationship is preserved.
-ARM_POSITION_ACCEL = 240
-FINGER_POSITION_ACCEL = 224
-
-# Safe production defaults. Native EMM-V5 accepts a larger range, but these
-# values keep the robot in the tested v1.2 operating region.
-V_TWIST = int(os.environ.get("CUBE_TWIST_RPM", "700"))
-V_FLIP = int(os.environ.get("CUBE_FLIP_RPM", "400"))
-V_NO_LOAD = int(os.environ.get("CUBE_NO_LOAD_RPM", "700"))
-V_FINGER = int(os.environ.get("CUBE_FINGER_RPM", "400"))
-MIN_RPM = 100
-MAX_RPM = 1400
-
-# Native EMM-V5 function bytes.
-FN_ENABLE = 0xF3
-FN_STOP = 0xFE
-FN_POSITION = 0xFD
-FN_READ_POS = 0x36
-FN_FLAGS = 0x3A
-FN_HEALTH = 0x3B
-FN_CLEAR_STALL = 0x0E
-
+# 配置日志
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(name)-12s | %(levelname)-8s | %(filename)s:%(lineno)d | %(message)s",
-    datefmt="%H:%M:%S",
+    format='%(asctime)s | %(name)-12s | %(levelname)-8s | %(filename)s:%(lineno)d | %(message)s',
+    datefmt='%H:%M:%S'
 )
 logger = logging.getLogger(__name__)
 
+# 通信接口配置
+DEFAULT_SERIAL_PORT = '/dev/cu.usbserial-120'
+BAUD_RATE = 1000000  # 1Mbps
 
-class MotionError(RuntimeError):
-    pass
+FINGER_FACTOR = 16384.0 / (2 * 31.416)# 手指电机每转一圈，手指移动距离31.4mm，两手指间距增加2 * 31.4mm
 
+# 运动控制配置 -- 零点
+ARM4_ZERO     = 15095  # 左侧旋转臂零点位置
+ARM2_ZERO     = 803  # 右侧旋转臂零点位置
+OFFSET_FINGER_1_ZERO = round(1.0 * FINGER_FACTOR) # 调整右手指的偏移量
+OFFSET_FINGER_3_ZERO = round(0.4 * FINGER_FACTOR) # 调整左手指的偏移量
 
-@dataclass(frozen=True)
-class _Move:
-    motor_id: int
-    logical_delta: int
-    rpm: int
-    accel: int
+# TODO 检查一下机械结构，为什么会有偏差？最初比较小，中间拆装过一次变大了。
 
+# 运动控制配置 -- 位置
+def finger_dist2enc(x): 
+    FINGER_ZERO   = 52.0                  # 零点位于距离内侧限位点0.5mm的位置，此时两手指间距52mm
+    return round((x - FINGER_ZERO) * FINGER_FACTOR)
+FINGER_CLAMP  = finger_dist2enc(54.0) # 手指锁紧，这是闭环控制的，可填写比实际需求小一点的数字
+FINGER_INIT   = finger_dist2enc(56.2) # 手指初始位置，用于放置魔方，52+2*2 = 56mm，与魔方边长保持一致(有的魔方偏大，可以改大点)
+FINGER_FLIP_WAIT = finger_dist2enc(57) # 翻转魔方时，手指移动到该位置，就同步开启对侧旋转板的旋转运动(需要比FINGER_INIT大一点，避免出现等待失效的BUG)
+FINGER_FLIP   = finger_dist2enc(78.0) # 翻转魔方时，手指移动的最远位置，最小74mm，留4mm余量
+FINGER_MAX    = finger_dist2enc(81.0) # 56*√2 = 79.2mm， 魔方是圆角的，实测值是77mm，留4mm余量，取81mm，机械结构最大支持到84mm
 
-# ---------------------------------------------------------------------------
-# Native EMM-V5 TTL driver
-# ---------------------------------------------------------------------------
+# 运动控制配置 -- 速度、加速度、电流
+MAX_CURRENT   = 100    # 最大电流
+CLAMP_CURRENT = 40     # 夹持魔方时的电流百分比
 
-class _NativeTTL:
-    """Native EMM-V5 multi-drop TTL driver using an already-open Serial."""
+# 速度比例，调整为1.0为标准还原速度，0.2为1/5速度
+# 不要使用过小的值，底层是用int处理的，可能会产生很大的误差
+SPEED_FACTOR  = 1.0
+SPEED_FACTOR2 = SPEED_FACTOR*SPEED_FACTOR
 
-    def __init__(self, ser):
-        self.ser = ser
-        self._lock = threading.RLock()
+V_FLIP  = round(200 * SPEED_FACTOR)  # 翻转魔方时的速度
+A_FLIP  = round(80 * SPEED_FACTOR2)  # 翻转魔方时的加速度，不宜过大，否则可能只旋转了一层，而不是三层一起旋转
 
-    @staticmethod
-    def _validate_id(motor_id: int) -> int:
-        motor_id = int(motor_id)
-        if motor_id not in MOTOR_IDS:
-            raise ValueError("motor_id must be 1..4")
-        return motor_id
+V_TWIST = round(350 * SPEED_FACTOR)  # 拧魔方时的速度，如果魔方的润滑比较好，可用调大一点
+A_TWIST = round(300 * SPEED_FACTOR2) # 拧魔方时的加速度，在停转不抖动的前提下，尽可能大
 
-    @staticmethod
-    def _validate_rpm(rpm: int) -> int:
-        rpm = int(rpm)
-        if not MIN_RPM <= rpm <= MAX_RPM:
-            raise ValueError("rpm must be %d..%d" % (MIN_RPM, MAX_RPM))
-        return rpm
+V_NO_LOAD = round(600 * SPEED_FACTOR) # 旋转臂空转最大速度
+A_NO_LOAD = round(300 * SPEED_FACTOR2)# 旋转臂空转最大加速度，在停转不抖动的前提下，尽可能大
 
-    @staticmethod
-    def _native_delta(motor_id: int, logical_delta: int) -> int:
-        """Convert logical robot direction to this motor's native direction."""
-        logical_delta = int(logical_delta)
-        if motor_id == RIGHT_ARM_ID and RIGHT_ARM_DIRECTION_INVERT:
-            return -logical_delta
-        if motor_id == LEFT_ARM_ID and LEFT_ARM_DIRECTION_INVERT:
-            return -logical_delta
-        return logical_delta
+V_FINGER = round(1500 * SPEED_FACTOR) #手指移动速度，这个惯性小，也不会变形，可用很快
+A_FINGER = round(1600 * SPEED_FACTOR2)
 
-    def _write(self, frame: Iterable[int]) -> bytes:
-        raw = bytes(frame)
-        if not raw or raw[-1] != CHECKSUM:
-            raise ValueError("native EMM-V5 frame must end in 0x6B")
-        self.ser.write(raw)
-        self.ser.flush()
-        return raw
+# 利用verify_arm_finger_linkage.py计算
+V_NO_LOAD_20_70_DEG = round(846 * SPEED_FACTOR)
+FINGER_NO_LOAD_START_ARM = finger_dist2enc(63.98)
 
-    def _read_reply(self, motor_id: int, function: int, expected_len: int,
-                    timeout: float = 1.0) -> bytes:
-        marker = bytes((motor_id & 0xFF, function & 0xFF))
-        data = bytearray()
-        deadline = time.monotonic() + timeout
+# 运动控制 -- 超时等待(单位s)
+ARM_MOTION_TIME_OUT = 5.0
 
-        while time.monotonic() < deadline:
-            try:
-                waiting = int(getattr(self.ser, "in_waiting", 0))
-            except (OSError, serial.SerialException):
-                waiting = 0
-
-            if waiting > 0:
-                data.extend(self.ser.read(waiting))
-                start = data.find(marker)
-                while start >= 0:
-                    end = start + expected_len
-                    if len(data) >= end and data[end - 1] == CHECKSUM:
-                        return bytes(data[start:end])
-                    start = data.find(marker, start + 1)
+# ------------------------------- 以下是485通信代码 -------------------------------
+def crc8(datagram):
+    """计算CRC8校验值，多项式0x07，初始值0x00"""
+    crc = 0
+    for byte in datagram:
+        current_byte = byte
+        for _ in range(8):
+            bit = (crc >> 7) ^ (current_byte & 0x01)
+            if bit:
+                crc = (crc << 1) ^ 0x07
             else:
-                # Some pyserial backends do not update in_waiting promptly.
-                chunk = self.ser.read(1)
-                if chunk:
-                    data.extend(chunk)
+                crc = (crc << 1)
+            crc &= 0xFF  # 保持8位
+            current_byte >>= 1
+    return crc
+
+def build_command_frame(motor_count, ids, command_types, data_list):
+    """
+    构造主机到电机控制器的数据帧
+    :param motor_count: 电机数量（1-8）
+    :param ids: 每个电机的ID列表，长度等于motor_count
+    :param command_types: 每个电机的指令类型列表
+    :param data_list: 每个电机的数据列表，元素为bytes类型
+    :return: 完整的字节数据帧
+    """
+    if motor_count < 1 or motor_count > 8:
+        raise ValueError("电机数量必须在1-8之间")
+    if len(ids) != motor_count or len(command_types) != motor_count or len(data_list) != motor_count:
+        raise ValueError("参数长度与电机数量不匹配")
+    
+    # 构造所有指令块
+    instruction_blocks = []
+    for i in range(motor_count):
+        id_byte = bytes([ids[i]])
+        cmd_byte = bytes([command_types[i]])
+        data_bytes = data_list[i]
+        block = id_byte + cmd_byte + data_bytes
+        instruction_blocks.append(block)
+    
+    # 合并指令块
+    instruction_data = b''.join(instruction_blocks)
+    
+    # 计算数据长度字段: 2(FF FF) + 1（自身） + 1（电机数量） + 指令块总长度 + 1（CRC）
+    data_length = 2 + 1 + 1 + len(instruction_data) + 1
+    if data_length > 128:
+        raise ValueError("数据长度超过最大限制128字节")
+        
+    # 构造完整数据帧
+    frame = b'\xff\xff'  # 字头
+    frame += bytes([data_length])
+    frame += bytes([motor_count])
+    frame += instruction_data
+    crc_value = crc8(frame)
+    frame += bytes([crc_value])
+    
+    return frame
+
+def receive_response(ser, expected_length=15, timeout=1):
+    """接收响应数据，并校验结构"""
+    start_time = time.time()
+    buffer = bytearray()
+    while time.time() - start_time < timeout:
+        if ser.in_waiting > 0:
+            buffer += ser.read(ser.in_waiting)
+            # 查找字头0xFF 0xFF
+            while len(buffer) >= 2:
+                pos = buffer.find(b'\xff\xff')
+                if pos == -1:
+                    # 没有找到字头，保留最后一个字节继续查找
+                    buffer = buffer[-1:] if buffer else bytearray()
+                    break
                 else:
-                    time.sleep(0.001)
+                    # 找到字头，截取后续数据
+                    buffer = buffer[pos:]
+                    if len(buffer) < expected_length:
+                        # 数据不足，继续等待
+                        break
+                    else:
+                        # 提取完整帧
+                        frame = buffer[:expected_length]
+                        buffer = buffer[expected_length:]
+                        return frame
+        time.sleep(0.001)
+    return None
 
-        raise MotionError(
-            "TTL timeout waiting for motor %d function 0x%02X; rx=%s"
-            % (motor_id, function, data.hex(" "))
-        )
+def parse_stat_response(frame):
+    """解析查询指令的响应数据"""
+    if len(frame) != 15:
+        raise ValueError("响应帧长度必须为15字节")
+    # 提取数据部分和CRC
+    data_part = frame[0:14]
+    received_crc = frame[14]
+    # 计算CRC
+    calculated_crc = crc8(data_part)
+    if calculated_crc != received_crc:
+        raise ValueError(f"CRC校验失败: 计算值{calculated_crc:02X}, 接收值{received_crc:02X}")
+    # 解析数据字段
+    flag = data_part[3]
+    if flag != 0:
+        raise ValueError(f"标志位不为零, flag={flag}")
+    cmd_count = struct.unpack('<H', data_part[4:6])[0]
+    trap_status = data_part[6]
+    temperature = struct.unpack('b', data_part[7:8])[0]
+    pos = struct.unpack('<i', data_part[8:12])[0]
+    voltage = struct.unpack('<h', data_part[12:14])[0]
+    return [cmd_count, trap_status, temperature, pos, voltage]
 
-    def request(self, frame: Iterable[int], expected_len: int,
-                timeout: float = 1.0) -> bytes:
-        raw = bytes(frame)
-        if len(raw) < 3:
-            raise ValueError("native motor request is too short")
-        motor_id = self._validate_id(raw[0])
-        function = raw[1]
-        if raw[-1] != CHECKSUM:
-            raise ValueError("native motor request must end in 0x6B")
-
-        with self._lock:
-            try:
-                self.ser.reset_input_buffer()
-            except (AttributeError, serial.SerialException):
-                pass
-            self._write(raw)
-            return self._read_reply(motor_id, function, expected_len, timeout)
-
-    @staticmethod
-    def _check_ack(reply: bytes, motor_id: int, function: int):
-        if (
-            len(reply) != 4
-            or reply[0] != motor_id
-            or reply[1] != function
-            or reply[3] != CHECKSUM
-        ):
-            raise MotionError("malformed native ACK: " + reply.hex(" "))
-        # EMM-V5 returns 0x02 for a successful command acknowledgement.
-        if reply[2] != 0x02:
-            raise MotionError(
-                "motor %d rejected function 0x%02X: %s"
-                % (motor_id, function, reply.hex(" "))
-            )
-
-    def enable(self, motor_id: int, enabled: bool, sync: bool = False):
-        motor_id = self._validate_id(motor_id)
-        frame = (
-            motor_id, FN_ENABLE, 0xAB,
-            1 if enabled else 0,
-            1 if sync else 0,
-            CHECKSUM,
-        )
-        reply = self.request(frame, 4, 1.2)
-        self._check_ack(reply, motor_id, FN_ENABLE)
-
-    def enable_ids(self, ids: Iterable[int], enabled: bool):
-        for motor_id in ids:
-            self.enable(int(motor_id), enabled)
-
-    def enable_all(self, enabled: bool):
-        self.enable_ids(MOTOR_IDS, enabled)
-
-    def stop(self, motor_id: int, sync: bool = False):
-        motor_id = self._validate_id(motor_id)
-        frame = (motor_id, FN_STOP, 0x98, 1 if sync else 0, CHECKSUM)
-        reply = self.request(frame, 4, 1.2)
-        self._check_ack(reply, motor_id, FN_STOP)
-
-    def stop_all(self):
-        errors = []
-        for motor_id in MOTOR_IDS:
-            try:
-                self.stop(motor_id)
-            except Exception as exc:
-                errors.append((motor_id, exc))
-        if errors:
-            logger.warning("best-effort stop had errors: %s", errors)
-
-    def clear_stall(self, motor_id: int):
-        motor_id = self._validate_id(motor_id)
-        reply = self.request((motor_id, FN_CLEAR_STALL, 0x52, CHECKSUM), 4, 1.2)
-        self._check_ack(reply, motor_id, FN_CLEAR_STALL)
-
-    def read_position_raw(self, motor_id: int) -> int:
-        motor_id = self._validate_id(motor_id)
-        reply = self.request((motor_id, FN_READ_POS, CHECKSUM), 8, 1.2)
-        if reply[0] != motor_id or reply[1] != FN_READ_POS or reply[-1] != CHECKSUM:
-            raise MotionError("bad encoder reply: " + reply.hex(" "))
-        magnitude = int.from_bytes(reply[3:7], "big", signed=False)
-        if magnitude > 0x7FFFFFFF:
-            raise MotionError("encoder magnitude outside signed 32-bit range")
-        return -magnitude if reply[2] == 1 else magnitude
-
-    @staticmethod
-    def raw_delta_to_pulses(raw_delta: int) -> float:
-        return float(raw_delta) * MOTOR_PULSES_PER_REV / ENCODER_COUNTS_PER_REV
-
-    def read_position_pulses(self, motor_id: int) -> float:
-        return self.raw_delta_to_pulses(self.read_position_raw(motor_id))
-
-    def read_flags(self, motor_id: int, function: int = FN_FLAGS) -> int:
-        motor_id = self._validate_id(motor_id)
-        if function not in (FN_FLAGS, FN_HEALTH):
-            raise ValueError("flag function must be 0x3A or 0x3B")
-        reply = self.request((motor_id, function, CHECKSUM), 4, 1.2)
-        if reply[0] != motor_id or reply[1] != function or reply[-1] != CHECKSUM:
-            raise MotionError("bad flags reply: " + reply.hex(" "))
-        return reply[2]
-
-    def assert_healthy(self, motor_id: int):
-        flags = self.read_flags(motor_id, FN_HEALTH)
-        if not (flags & 0x01):
-            raise MotionError("motor %d encoder not ready: 0x%02X" % (motor_id, flags))
-        if not (flags & 0x02):
-            raise MotionError("motor %d calibration not ready: 0x%02X" % (motor_id, flags))
-        if flags & 0x10:
-            raise MotionError("motor %d over-temperature: 0x%02X" % (motor_id, flags))
-        if flags & 0x20:
-            raise MotionError("motor %d over-current: 0x%02X" % (motor_id, flags))
-
-    def queue_position(self, move: _Move):
-        motor_id = self._validate_id(move.motor_id)
-        rpm = self._validate_rpm(move.rpm)
-        accel = int(move.accel)
-        if not 0 <= accel <= 255:
-            raise ValueError("accel must be 0..255")
-
-        native_delta = self._native_delta(motor_id, move.logical_delta)
-        direction = 1 if native_delta < 0 else 0
-        pulses = abs(int(native_delta))
-        if pulses > 0xFFFFFFFF:
-            raise ValueError("position delta is too large")
-
-        # Native EMM-V5 relative position, queued for synchronized start:
-        # ID FD DIR RPM_H RPM_L ACC POS[4] RELATIVE(0) SYNC(1) 6B
-        frame = (
-            motor_id, FN_POSITION, direction,
-            (rpm >> 8) & 0xFF, rpm & 0xFF,
-            accel,
-            (pulses >> 24) & 0xFF,
-            (pulses >> 16) & 0xFF,
-            (pulses >> 8) & 0xFF,
-            pulses & 0xFF,
-            0x00,  # relative mode
-            0x01,  # synchronized-start queue
-            CHECKSUM,
-        )
-        reply = self.request(frame, 4, 1.5)
-        self._check_ack(reply, motor_id, FN_POSITION)
-
-    def sync_start(self):
-        # Native EMM-V5 multi-axis broadcast. A direct TTL adapter can place
-        # this frame on the motor bus without any intermediary translation.
-        with self._lock:
-            self._write((0x00, 0xFF, 0x66, CHECKSUM))
-
-    def wait_complete(self, motor_ids: Iterable[int], start_positions: dict[int, float],
-                      timeout: float = 6.0):
-        pending = set(int(x) for x in motor_ids)
-        deadline = time.monotonic() + timeout
-        started = time.monotonic()
-        moved = {motor_id: False for motor_id in pending}
-
-        # The completion flag can be latched from a previous trajectory on
-        # some drive revisions. Require actual movement or >=120 ms elapsed.
-        time.sleep(0.03)
-        while pending and time.monotonic() < deadline:
-            for motor_id in tuple(pending):
-                flags = self.read_flags(motor_id, FN_FLAGS)
-                if flags & 0x0C:
-                    raise MotionError(
-                        "motor %d stall/protection flags=0x%02X" % (motor_id, flags)
-                    )
-                now = self.read_position_pulses(motor_id)
-                if abs(now - start_positions[motor_id]) > 8:
-                    moved[motor_id] = True
-                if (flags & 0x02) and (moved[motor_id] or time.monotonic() - started >= 0.12):
-                    pending.remove(motor_id)
-            if pending:
-                time.sleep(0.01)
-
-        if pending:
-            raise MotionError("motion timeout waiting for motors %s" % sorted(pending))
-
-
-# ---------------------------------------------------------------------------
-# Legacy diagnostic helpers
-# ---------------------------------------------------------------------------
-
-def list_serial_ports():
-    ports = list_ports.comports()
-    if not ports:
-        print("No serial ports detected")
-        return
-    print("Available serial ports:")
-    for port in ports:
-        print("  %s - %s" % (port.device, port.description))
-
-
-def cmd_enable(ser, id_list, en):
-    ids = [int(x) for x in id_list]
-    if not ids:
-        return True
-    _NativeTTL(ser).enable_ids(ids, bool(en))
+def parse_other_response(response_frame):
+    if len(response_frame) != 5:
+        raise ValueError("响应帧长度必须为5字节")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("接收到响应帧: %s", response_frame.hex())
+    # 计算CRC
+    calculated_crc = crc8(response_frame[0:4])
+    received_crc = response_frame[4]
+    if calculated_crc != received_crc:
+        raise ValueError(f"CRC校验失败: 计算值{calculated_crc:02X}, 接收值{received_crc:02X}")
+    # 解析数据字段
+    flag = response_frame[3]
+    if flag != 0:
+        raise ValueError(f"标志位不为零, flag={flag}")
     return True
 
+# 使能、禁用编号为id_list的电机，可同步控制多个
+# 用法举例，禁用编号为1,2的电机: cmd_enable(ser,[1,2],0)
+def cmd_enable(ser, id_list, en):
+    # 构造使能指令（0x01）
+    data = bytes([en])  # 启用动力
+    motor_count = len(id_list) 
+    enable_frame = build_command_frame(
+        motor_count, 
+        id_list, 
+        [0x01] * motor_count, 
+        [data] * motor_count)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("使能指令数据帧: %s", enable_frame.hex())
+    ser.write(enable_frame)
 
-def cmd_stat(ser, motor_id):
-    """Return old-style [count, trap, temp, pos, voltage] diagnostics."""
-    bus = _NativeTTL(ser)
-    motor_id = int(motor_id)
-    flags = bus.read_flags(motor_id, FN_FLAGS)
-    pos = round(bus.read_position_pulses(motor_id))
-    trap_status = 1 if (flags & 0x0C) else 0
-    return [0, trap_status, 0, pos, 0]
+    # 接收响应
+    response_frame = receive_response(ser, 5)
+    return parse_other_response(response_frame)
 
+def cmd_stat(ser, id):
+    # 构造查询指令（0x00）
+    motor_count = 1
+    ids = [id]
+    command_types = [0x00]
+    data_list = [bytes()]  # 无数据部分
+    stat_frame = build_command_frame(motor_count, ids, command_types, data_list)
+    #logger.debug(f"电机编号: {id}, 查询指令数据帧: {stat_frame.hex()}")
+    ser.write(stat_frame)
 
-def cmd_get_pos(ser, motor_id):
-    return round(_NativeTTL(ser).read_position_pulses(int(motor_id)))
+    # 接收并解析响应
+    response_frame = receive_response(ser, 15)
+    if response_frame:
+        #logger.debug(f"接收到响应帧: {response_frame.hex()}")
+        parsed_data = parse_stat_response(response_frame)
+        # logger.debug(f"[count, trap, temp, pos, voltage]={parsed_data}")
+        return parsed_data
+    else:
+        logger.debug("未接收到响应")
+        return None
 
+def cmd_wait_motion(ser, id):
+    logger.debug("等待%d号控制板完成运动控制", id)
+    start_time = time.time()
+    while(True):
+        resp = cmd_stat(ser, id)
+        pos = resp[3]
+        if resp[1] == 0:
+            break
+    logger.debug("耗时: %.2fms", 1000*(time.time() - start_time))
+    return pos
 
-def cmd_wait_motion(ser, motor_id, timeout=6.0):
-    bus = _NativeTTL(ser)
-    motor_id = int(motor_id)
-    deadline = time.monotonic() + float(timeout)
-    while time.monotonic() < deadline:
-        flags = bus.read_flags(motor_id, FN_FLAGS)
-        if flags & 0x0C:
-            raise MotionError("motor %d stall/protection flags=0x%02X" % (motor_id, flags))
-        if flags & 0x02:
-            return round(bus.read_position_pulses(motor_id))
-        time.sleep(0.01)
-    raise MotionError("motion timeout waiting for motor %d" % motor_id)
+def cmd_get_pos(ser, id):
+    resp = cmd_stat(ser, id)
+    # logger.debug("获取%d号控制板当前位置%d", id, resp[3])
+    return resp[3]
 
+def cmd_trap(ser, id_list, zero, trap_list):
+    count = len(id_list)
+    cmd_type = 0x03 if zero else 0x02
+    data_bytes = [None]*count
+    for i in range (count):
+        data_bytes[i] = struct.pack('<i', trap_list[i][0])  # int32 x1
+        data_bytes[i] += struct.pack('<h', trap_list[i][1]) # int16 v1
+        data_bytes[i] += struct.pack('<h', trap_list[i][2]) # int16 vmax
+        data_bytes[i] += struct.pack('<h', trap_list[i][3]) # int16 a
+        data_bytes[i] += bytes([trap_list[i][4]])           # uint8 max_current
+    trap_frame = build_command_frame(count, id_list, [cmd_type]*count, data_bytes)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("梯形运动指令数据帧: %s", trap_frame.hex())
+    ser.write(trap_frame)
 
+    # 接收响应
+    response_frame = receive_response(ser, 5)
+    return parse_other_response(response_frame)
+
+# ------------------------------- 以下是回零点代码 -------------------------------
+# 同步带版本和齿轮版本的区别
+# 1 手指的控制方向是反的
+# 2 齿轮分度圆周长不同
+# 3 同步带版本旋转臂带有1:2减速，齿轮版本是1:1的
 def cmd_zero(ser):
-    """Record the current safe mechanical pose as the PC-side reference.
+    # 根据测试情况修改
+    current = 15 #电流15%
+    accel = 20
+    speed_slow = 30
+    speed_fast = 100
+    # 禁用全部电机4
+    cmd_enable(ser, [1,2,3,4], 0)
+    # 手指1回零点
+    cmd_enable(ser, [1, 2], True)
+    finger1_pos_old = cmd_get_pos(ser, 1)
+    # 位置，终止速度，最大速度30RPM，加速度，电流current
+    cmd_trap(ser, [1], True, [[finger1_pos_old - 10000, 0, speed_slow, accel, current]]) 
+    finger1_pos = cmd_wait_motion(ser, 1)
+    motion_distance = finger1_pos - finger1_pos_old
+    logger.info(f"手指1回零点过程移动距离: {motion_distance}, 目前位置: {finger1_pos}")
+    # 手指行程17mm，20齿0.5模齿轮分度圆约31.4mm，17/31.4*16384 = 8870
+    if (abs(motion_distance) > 10500):
+        logger.error("移动距离过长，回零点失败")
+        return None
+    finger1_pos += OFFSET_FINGER_1_ZERO
+    cmd_trap(ser, [1], False, [[finger1_pos, 0, speed_slow, accel, MAX_CURRENT]]) # 回退0.5mm
+    cmd_wait_motion(ser, 1)
+    # 旋转臂2回零点
+    arm2_pos = cmd_get_pos(ser, 2)
+    arm2_zero = ARM2_ZERO + ( - round(ARM2_ZERO / 16384) + round(arm2_pos / 16384)) * 16384
+    finger1_pos += (arm2_zero - arm2_pos) // 2
+    # 旋转臂带有1:2减速，因此需要双倍速运行
+    cmd_trap(ser, [1, 2], False, [[finger1_pos, 0, speed_fast, accel, MAX_CURRENT], 
+                                  [arm2_zero, 0, speed_fast*2, accel*2, MAX_CURRENT]])
+    cmd_wait_motion(ser, 2)
+    arm2_pos = arm2_zero
 
-    Return order is native motor ID order (1,2,3,4). ``MotionCtrl`` accepts the
-    tuple directly, so existing ``zero = cmd_zero(); MotionCtrl(ser,*zero)``
-    code does not need to change.
-    """
-    bus = _NativeTTL(ser)
-    try:
-        # Stop residual motion before defining the reference.
-        bus.stop_all()
-        time.sleep(0.08)
+    # 手指3回零点
+    cmd_enable(ser, [3, 4], True)
+    finger3_pos_old = cmd_get_pos(ser, 3)
+    # 位置，终止速度，最大速度30RPM，加速度，电流current
+    cmd_trap(ser, [3], True, [[finger3_pos_old - 10000, 0, speed_slow, accel, current]]) 
+    finger3_pos = cmd_wait_motion(ser, 3)
+    motion_distance = finger3_pos - finger3_pos_old
+    logger.info(f"手指3回零点过程移动距离: {motion_distance}, 目前位置: {finger3_pos}")
+    if (abs(motion_distance) > 10500):
+        logger.error("移动距离过长，回零点失败")
+        return None
+    finger3_pos += OFFSET_FINGER_3_ZERO
+    cmd_trap(ser, [3], False, [[finger3_pos, 0, speed_slow, accel, MAX_CURRENT]]) # 回退0.5mm
+    cmd_wait_motion(ser, 3)
+    # 旋转臂4回零点
+    arm4_pos = cmd_get_pos(ser, 4)
+    arm4_zero = ARM4_ZERO + ( - round(ARM4_ZERO / 16384) + round(arm4_pos / 16384)) * 16384
+    finger3_pos += (arm4_zero - arm4_pos) // 2
+    cmd_trap(ser, [3, 4], False, [[finger3_pos, 0, speed_fast, accel, MAX_CURRENT], 
+                                  [arm4_zero, 0, speed_fast*2, accel*2, MAX_CURRENT]])
+    cmd_wait_motion(ser, 4)
+    arm4_pos = arm4_zero
+    logger.info(f"finger1_pos={finger1_pos}")
+    logger.info(f"arm2_pos={arm2_pos}")
+    logger.info(f"finger3_pos={finger3_pos}")
+    logger.info(f"arm4_pos={arm4_pos}")
+    
+    return (finger1_pos, arm2_pos, finger3_pos, arm4_pos)
 
-        for motor_id in MOTOR_IDS:
-            flags = bus.read_flags(motor_id, FN_FLAGS)
-            if flags & 0x0C:
-                # Clear a latched stall only while the robot is stationary.
-                bus.clear_stall(motor_id)
-                time.sleep(0.03)
-            bus.assert_healthy(motor_id)
-
-        refs = tuple(bus.read_position_raw(motor_id) for motor_id in MOTOR_IDS)
-        bus.enable_all(True)
-        logger.info(
-            "Direct TTL reference recorded: id1=%d id2=%d id3=%d id4=%d",
-            refs[0], refs[1], refs[2], refs[3],
-        )
-        return refs
-    except Exception:
-        try:
-            bus.stop_all()
-        except Exception:
-            pass
-        raise
-
-
-# ---------------------------------------------------------------------------
-# High-level cube motion controller
-# ---------------------------------------------------------------------------
-
-_FOUR_TOKEN = {
-    ("L2", "L+N", "R-F", "L0"): ("R", -90),
-    ("L2", "L+N", "R+F", "L0"): ("R", +90),
-    ("L2", "L+N", "R*F", "L0"): ("R", -180),
-    ("R2", "R+N", "L-F", "R0"): ("L", -90),
-    ("R2", "R+N", "L+F", "R0"): ("L", +90),
-    ("R2", "R+N", "L*F", "R0"): ("L", -180),
-}
-
-_ARM_BACK_THREE = {
-    ("L2", "L+N", "L0"): "L",
-    ("R2", "R+N", "R0"): "R",
-}
-
-_FLIP_THREE = {
-    ("L1", "R+F", "L0"): ("R", +90),
-    ("L1", "R-F", "L0"): ("R", -90),
-    ("L1", "R*F", "L0"): ("R", -180),
-    ("R1", "L+F", "R0"): ("L", +90),
-    ("R1", "L-F", "R0"): ("L", -90),
-    ("R1", "L*F", "R0"): ("L", -180),
-}
-
+# ------------------------------- 以下是运动控制代码 -------------------------------
+LEFT          = True
+RIGHT         = False
+CW            = True
+CCW           = False
 
 class MotionCtrl:
-    """Direct native-TTL Rubik's-cube motion controller."""
+    def __init__(self, ser, finger1_pos, arm2_pos, finger3_pos, arm4_pos):
+        self.finger_zero = [finger1_pos, finger3_pos]
+        self.arm_zero = [arm2_pos, arm4_pos]
 
-    def __init__(self, ser, ref1=0, ref2=0, ref3=0, ref4=0):
+        self.finger_offset = [0, 0]
+        self.arm_offset = [0, 0]
+
         self.ser = ser
-        self.bus = _NativeTTL(ser)
-        self.ref_raw = {
-            RIGHT_ARM_ID: int(ref1),
-            RIGHT_FINGER_ID: int(ref2),
-            LEFT_ARM_ID: int(ref3),
-            LEFT_FINGER_ID: int(ref4),
-        }
-        self.arm = {"R": 0, "L": 0}
-        self.jaw = {"R": JAW_CLAMP, "L": JAW_CLAMP}
-        # Per-side adaptive clamp position. If a hard clamp drags the cube/arm,
-        # overflow recovery backs this target off for the rest of the run.
-        self.clamp_target = {"R": JAW_CLAMP, "L": JAW_CLAMP}
+        pass
 
-    # ------------------------- state / geometry -------------------------
+    def check_arm_pos(self, real, expect, id):
+        start_time = time.time()
+        MAX_ERROR = round(8192 * (2/90)) # 最多允许2°误差
+        error = abs(real - expect)
+        logger.debug(f"手臂角度误差{error}")
+        if error > MAX_ERROR:
+            logger.debug(f"手臂角度超差，等待误差合格。当前误差{error}，最大允许{MAX_ERROR}。")
+            while True:
+                error = abs(cmd_get_pos(self.ser, id) - expect)
+                end_time = time.time()
+                if error <= MAX_ERROR:
+                    logger.debug("耗时: %.2fms", 1000*(end_time - start_time))
+                    break
+                if end_time - start_time > ARM_MOTION_TIME_OUT:
+                    logger.error(f"运动控制超时，可能是出现了电机堵转问题")
+                    cmd_enable(self.ser, [1,2,3,4], 0)
+                    logger.error(f"关闭全部电机")
+                    raise ValueError('运动控制超时')                    
 
-    @staticmethod
-    def _arm_id(side: str) -> int:
-        if side == "R":
-            return RIGHT_ARM_ID
-        if side == "L":
-            return LEFT_ARM_ID
-        raise MotionError("side must be 'L' or 'R'")
-
-    @staticmethod
-    def _finger_id(side: str) -> int:
-        if side == "R":
-            return RIGHT_FINGER_ID
-        if side == "L":
-            return LEFT_FINGER_ID
-        raise MotionError("side must be 'L' or 'R'")
-
-    @staticmethod
-    def _side_from_bool(left: bool) -> str:
-        return "L" if bool(left) else "R"
-
-    def _actual(self, motor_id: int) -> float:
-        raw = self.bus.read_position_raw(motor_id)
-        pulses = self.bus.raw_delta_to_pulses(raw - self.ref_raw[motor_id])
-        # Commands for an inverted arm are converted from logical to native
-        # direction in queue_position(). Encoder feedback must be converted
-        # back the same way or the host would see a correct right-arm move as
-        # having the opposite sign.
-        if motor_id == RIGHT_ARM_ID and RIGHT_ARM_FEEDBACK_INVERT:
-            pulses = -pulses
-        if motor_id == LEFT_ARM_ID and LEFT_ARM_DIRECTION_INVERT:
-            pulses = -pulses
-        return pulses
-
-    def _expected_motor(self, motor_id: int) -> float:
-        if motor_id == RIGHT_ARM_ID:
-            return float(self.arm["R"])
-        if motor_id == LEFT_ARM_ID:
-            return float(self.arm["L"])
-        if motor_id == RIGHT_FINGER_ID:
-            return float(self.jaw["R"] + self.arm["R"] / 2.0)
-        if motor_id == LEFT_FINGER_ID:
-            return float(self.jaw["L"] + self.arm["L"] / 2.0)
-        raise ValueError("motor_id must be 1..4")
-
-    def _verify_motor(self, motor_id: int, expected: float | None = None):
-        if expected is None:
-            expected = self._expected_motor(motor_id)
-        actual = self._actual(motor_id)
-        error = actual - expected
-        if abs(error) > POSITION_TOLERANCE_PULSES:
-            raise MotionError(
-                "motor %d position mismatch: actual=%.1f expected=%.1f error=%.1f"
-                % (motor_id, actual, expected, error)
-            )
-        return actual
-
-    def verify_all(self):
-        return {motor_id: self._verify_motor(motor_id) for motor_id in MOTOR_IDS}
-
-    def _reconcile_from_encoders(self):
-        """Rebuild host arm/jaw state from the four referenced encoders."""
-        right_arm = round(self._actual(RIGHT_ARM_ID))
-        left_arm = round(self._actual(LEFT_ARM_ID))
-        right_finger = round(self._actual(RIGHT_FINGER_ID))
-        left_finger = round(self._actual(LEFT_FINGER_ID))
-        right_jaw = round(right_finger - right_arm / 2.0)
-        left_jaw = round(left_finger - left_arm / 2.0)
-
-        if not -POSITION_TOLERANCE_PULSES <= right_jaw <= JAW_MAX_FROM_CLAMP + POSITION_TOLERANCE_PULSES:
-            raise MotionError("right jaw encoder state is outside safe reference range")
-        if not -POSITION_TOLERANCE_PULSES <= left_jaw <= JAW_MAX_FROM_CLAMP + POSITION_TOLERANCE_PULSES:
-            raise MotionError("left jaw encoder state is outside safe reference range")
-
-        self.arm["R"] = right_arm
-        self.arm["L"] = left_arm
-        self.jaw["R"] = max(JAW_CLAMP, min(JAW_MAX_FROM_CLAMP, right_jaw))
-        self.jaw["L"] = max(JAW_CLAMP, min(JAW_MAX_FROM_CLAMP, left_jaw))
-
-    def _check_finger_target(self, motor_id: int, target: float):
-        if motor_id not in FINGER_IDS:
-            return
-        if target < -BELT_FINGER_MAX_PULSES or target > BELT_FINGER_MAX_PULSES:
-            raise MotionError(
-                "finger motor %d target %.1f exceeds belt safety envelope"
-                % (motor_id, target)
-            )
-
-    def _single_arm_collision_allowed(self, side: str, delta: int) -> bool:
-        other = "L" if side == "R" else "R"
-        current_arm = self.arm[side]
-        next_arm = current_arm + delta
-        current_gap = current_arm - self.arm[other]
-        next_gap = current_gap + delta
-        current_abs = abs(current_gap)
-        next_abs = abs(next_gap)
-
-        if (
-            current_abs < ARM_V_COLLISION_GAP_PULSES
-            and next_abs < current_abs
-            and abs(next_arm) > abs(current_arm)
-        ):
-            return False
-        if (current_gap > 0 > next_gap) or (current_gap < 0 < next_gap):
-            return False
-        return True
-
-    def _pair_collision_allowed(self, side_a: str, delta_a: int,
-                                side_b: str, delta_b: int) -> bool:
-        gap = self.arm[side_a] - self.arm[side_b]
-        next_gap = gap + delta_a - delta_b
-        if abs(gap) < ARM_V_COLLISION_GAP_PULSES and abs(next_gap) < abs(gap):
-            return False
-        return True
-
-    # ------------------------- native synchronized motion -------------------------
-
-    def _sync(self, moves: Sequence[_Move], timeout: float = 6.0):
-        moves = [move for move in moves if int(move.logical_delta) != 0]
-        if not moves:
-            return
-        ids = [move.motor_id for move in moves]
-        if len(ids) != len(set(ids)):
-            raise MotionError("duplicate motor ID in synchronized trajectory")
-
-        starts = {}
-        targets = {}
-        for move in moves:
-            self._verify_motor(move.motor_id)
-            starts[move.motor_id] = self.bus.read_position_pulses(move.motor_id)
-            target = self._expected_motor(move.motor_id) + move.logical_delta
-            self._check_finger_target(move.motor_id, target)
-            targets[move.motor_id] = target
-
-        try:
-            for move in moves:
-                self.bus.queue_position(move)
-            self.bus.sync_start()
-            self.bus.wait_complete(ids, starts, timeout=timeout)
-
-            for motor_id, target in targets.items():
-                self._verify_motor(motor_id, target)
-        except Exception:
-            self.bus.stop_all()
-            raise
-
-    def _recovery_sync(self, moves: Sequence[_Move], timeout: float = 5.0):
-        """Relative native-TTL move used only while recovering encoder drift.
-
-        Normal _sync() intentionally refuses to move a motor whose encoder is
-        already away from the planned host state. Overflow recovery is exactly
-        the case where the arm is known to be displaced, so this helper verifies
-        the *relative correction* instead of requiring the old absolute state.
-        """
-        moves = [move for move in moves if int(move.logical_delta) != 0]
-        if not moves:
-            return
-        ids = [move.motor_id for move in moves]
-        if len(ids) != len(set(ids)):
-            raise MotionError("duplicate motor ID in recovery trajectory")
-
-        native_starts = {}
-        logical_starts = {}
-        for move in moves:
-            logical_starts[move.motor_id] = self._actual(move.motor_id)
-            native_starts[move.motor_id] = self.bus.read_position_pulses(move.motor_id)
-            if move.motor_id in FINGER_IDS:
-                self._check_finger_target(
-                    move.motor_id,
-                    logical_starts[move.motor_id] + move.logical_delta,
-                )
-
-        try:
-            for move in moves:
-                self.bus.queue_position(move)
-            self.bus.sync_start()
-            self.bus.wait_complete(ids, native_starts, timeout=timeout)
-
-            # Recovery is deliberately slower than normal motion. Verify that
-            # each axis actually performed the requested relative correction.
-            for move in moves:
-                after = self._actual(move.motor_id)
-                travelled = after - logical_starts[move.motor_id]
-                error = travelled - move.logical_delta
-                if abs(error) > POSITION_TOLERANCE_PULSES:
-                    raise MotionError(
-                        "recovery motor %d delta mismatch: moved=%.1f expected=%d error=%.1f"
-                        % (move.motor_id, travelled, move.logical_delta, error)
-                    )
-        except Exception:
-            self.bus.stop_all()
-            raise
-
-    def _arm_encoder_errors(self):
-        return {
-            "R": self._actual(RIGHT_ARM_ID) - self.arm["R"],
-            "L": self._actual(LEFT_ARM_ID) - self.arm["L"],
-        }
-
-    @staticmethod
-    def _recovery_pair_collision_allowed(actual_r: float, delta_r: int,
-                                         actual_l: float, delta_l: int) -> bool:
-        current_gap = actual_r - actual_l
-        next_gap = (actual_r + delta_r) - (actual_l + delta_l)
-        # Do not let a recovery cross the two arm orientations through each
-        # other. When already close to the collision region, only allow a move
-        # that increases their separation.
-        if (current_gap > 0 > next_gap) or (current_gap < 0 < next_gap):
-            return False
-        if abs(current_gap) < ARM_V_COLLISION_GAP_PULSES and abs(next_gap) < abs(current_gap):
-            return False
-        return True
-
-    def _refresh_jaw_from_encoder(self, side: str):
-        arm_actual = self._actual(self._arm_id(side))
-        finger_actual = self._actual(self._finger_id(side))
-        jaw_actual = round(finger_actual - arm_actual / 2.0)
-        if -POSITION_TOLERANCE_PULSES <= jaw_actual <= JAW_MAX_FROM_CLAMP + POSITION_TOLERANCE_PULSES:
-            self.jaw[side] = max(JAW_CLAMP, min(JAW_MAX_FROM_CLAMP, jaw_actual))
-        return jaw_actual
-
-    def _recover_clamp_overflow(self, clamped_sides: Sequence[str]):
-        """Detect and undo arm rotation caused by an over-tight cube clamp.
-
-        The planned arm state is kept unchanged. If clamp force has physically
-        dragged either arm away from that state, the routine:
-          1. slightly opens any currently clamped jaw involved in holding cube,
-          2. remembers the softer clamp target for later clamps,
-          3. returns displaced arm(s) to the planned encoder positions while
-             solving the finger targets for the softened jaw coordinates.
-        """
-        clamped_sides = tuple(side for side in clamped_sides if side in ("R", "L"))
-        if not clamped_sides:
-            return False
-
-        time.sleep(max(0.0, CLAMP_SETTLE_SECONDS))
-        trigger = CLAMP_OVERFLOW_TRIGGER_DEG * ARM_PULSES_PER_DEG
-        settle = CLAMP_OVERFLOW_SETTLE_DEG * ARM_PULSES_PER_DEG
-        max_error = CLAMP_OVERFLOW_MAX_DEG * ARM_PULSES_PER_DEG
-        max_step = max(1, round(CLAMP_RECOVERY_STEP_DEG * ARM_PULSES_PER_DEG))
-
-        errors = self._arm_encoder_errors()
-        affected = [side for side in ("R", "L") if abs(errors[side]) > trigger]
-        if not affected:
-            return False
-
-        for side in affected:
-            if abs(errors[side]) > max_error:
-                raise MotionError(
-                    "%s arm clamp overflow %.1f deg exceeds %.1f deg safety limit"
-                    % (side, errors[side] / ARM_PULSES_PER_DEG, CLAMP_OVERFLOW_MAX_DEG)
-                )
-
-        logger.warning(
-            "clamp overflow detected: R=%+.1f deg L=%+.1f deg; starting recovery",
-            errors["R"] / ARM_PULSES_PER_DEG,
-            errors["L"] / ARM_PULSES_PER_DEG,
-        )
-
-        # Back off jaws that are actually in a clamp state. This prevents the
-        # same excess grip force from immediately dragging the corrected arm
-        # away again. The adjusted target is retained for subsequent clamps.
-        relax_moves = []
-        for side in ("R", "L"):
-            if self.jaw[side] <= CLAMP_SOFT_MAX_PULSES:
-                old = int(self.jaw[side])
-                new = min(
-                    JAW_RELEASE,
-                    CLAMP_SOFT_MAX_PULSES,
-                    max(self.clamp_target[side], old) + CLAMP_RECOVERY_BACKOFF_PULSES,
-                )
-                if new > old:
-                    relax_moves.append(
-                        _Move(self._finger_id(side), new - old,
-                              CLAMP_RECOVERY_RPM, CLAMP_RECOVERY_ACCEL)
-                    )
-                    self.clamp_target[side] = new
-
-        if relax_moves:
-            self._recovery_sync(relax_moves, timeout=4.0)
-            for side in ("R", "L"):
-                self._refresh_jaw_from_encoder(side)
-            logger.warning(
-                "adaptive clamp softened: R=%d L=%d pulses",
-                self.clamp_target["R"], self.clamp_target["L"],
-            )
-
-        for attempt in range(1, CLAMP_RECOVERY_ATTEMPTS + 1):
-            actual_r = self._actual(RIGHT_ARM_ID)
-            actual_l = self._actual(LEFT_ARM_ID)
-            actual_rf = self._actual(RIGHT_FINGER_ID)
-            actual_lf = self._actual(LEFT_FINGER_ID)
-            err_r = actual_r - self.arm["R"]
-            err_l = actual_l - self.arm["L"]
-
-            # The final finger target is solved independently from the arm
-            # correction. This is essential: finger=arm_delta/2 would preserve
-            # the already over-tight jaw geometry that caused the overflow.
-            desired_rf = self.clamp_target["R"] + self.arm["R"] / 2.0
-            desired_lf = self.clamp_target["L"] + self.arm["L"] / 2.0
-            jaw_err_r = actual_rf - desired_rf
-            jaw_err_l = actual_lf - desired_lf
-
-            if (
-                abs(err_r) <= settle and abs(err_l) <= settle
-                and abs(jaw_err_r) <= POSITION_TOLERANCE_PULSES
-                and abs(jaw_err_l) <= POSITION_TOLERANCE_PULSES
-            ):
-                break
-            if abs(err_r) > max_error or abs(err_l) > max_error:
-                raise MotionError("clamp overflow grew outside recovery safety envelope")
-
-            corr_r = 0 if abs(err_r) <= settle else int(round(-err_r))
-            corr_l = 0 if abs(err_l) <= settle else int(round(-err_l))
-            corr_r = max(-max_step, min(max_step, corr_r))
-            corr_l = max(-max_step, min(max_step, corr_l))
-
-            if not self._recovery_pair_collision_allowed(actual_r, corr_r, actual_l, corr_l):
-                raise MotionError("collision guard rejected clamp-overflow recovery")
-
-            # Move fingers toward the *final softened jaw coordinates* while
-            # the arms return toward their planned angles. Limit finger travel
-            # per pass so a bad encoder/reference cannot cause a violent jaw
-            # opening/closing command.
-            finger_step = max_step
-            corr_rf = int(round(desired_rf - actual_rf))
-            corr_lf = int(round(desired_lf - actual_lf))
-            corr_rf = max(-finger_step, min(finger_step, corr_rf))
-            corr_lf = max(-finger_step, min(finger_step, corr_lf))
-
-            recovery_moves = []
-            if corr_rf:
-                recovery_moves.append(
-                    _Move(RIGHT_FINGER_ID, corr_rf,
-                          max(MIN_RPM, CLAMP_RECOVERY_RPM // 2), CLAMP_RECOVERY_ACCEL)
-                )
-            if corr_r:
-                recovery_moves.append(
-                    _Move(RIGHT_ARM_ID, corr_r,
-                          CLAMP_RECOVERY_RPM, CLAMP_RECOVERY_ACCEL)
-                )
-            if corr_lf:
-                recovery_moves.append(
-                    _Move(LEFT_FINGER_ID, corr_lf,
-                          max(MIN_RPM, CLAMP_RECOVERY_RPM // 2), CLAMP_RECOVERY_ACCEL)
-                )
-            if corr_l:
-                recovery_moves.append(
-                    _Move(LEFT_ARM_ID, corr_l,
-                          CLAMP_RECOVERY_RPM, CLAMP_RECOVERY_ACCEL)
-                )
-
-            logger.warning(
-                "clamp recovery pass %d: arm R=%+.1f deg L=%+.1f deg, finger R=%+d L=%+d",
-                attempt,
-                corr_r / ARM_PULSES_PER_DEG,
-                corr_l / ARM_PULSES_PER_DEG,
-                corr_rf,
-                corr_lf,
-            )
-            self._recovery_sync(recovery_moves, timeout=6.0)
-
-        errors = self._arm_encoder_errors()
-        for side in ("R", "L"):
-            self._refresh_jaw_from_encoder(side)
-        if abs(errors["R"]) > settle or abs(errors["L"]) > settle:
-            raise MotionError(
-                "clamp overflow recovery incomplete: R=%+.1f deg L=%+.1f deg"
-                % (
-                    errors["R"] / ARM_PULSES_PER_DEG,
-                    errors["L"] / ARM_PULSES_PER_DEG,
-                )
-            )
-
-        logger.info(
-            "clamp overflow recovered: R=%+.2f deg L=%+.2f deg",
-            errors["R"] / ARM_PULSES_PER_DEG,
-            errors["L"] / ARM_PULSES_PER_DEG,
-        )
-        return True
-
-    def _move_jaw(self, side: str, target: int, rpm: int = V_FINGER):
-        requested_target = int(target)
-        if requested_target == JAW_CLAMP:
-            target = int(self.clamp_target[side])
-        else:
-            target = requested_target
-        if not JAW_CLAMP <= target <= JAW_MAX_FROM_CLAMP:
-            raise MotionError("jaw target %d outside safe range" % target)
-        delta = target - self.jaw[side]
-        if delta:
-            finger = self._finger_id(side)
-            self._sync((
-                _Move(finger, delta, rpm, FINGER_POSITION_ACCEL),
-            ))
-            self.jaw[side] = target
-        if requested_target == JAW_CLAMP:
-            self._recover_clamp_overflow((side,))
-
-    def _move_both_jaws(self, target: int, rpm: int = V_FINGER):
-        requested_target = int(target)
-        if not JAW_CLAMP <= requested_target <= JAW_MAX_FROM_CLAMP:
-            raise MotionError("jaw target %d outside safe range" % requested_target)
-        moves = []
-        targets = {}
-        for side in ("R", "L"):
-            side_target = self.clamp_target[side] if requested_target == JAW_CLAMP else requested_target
-            side_target = int(side_target)
-            targets[side] = side_target
-            delta = side_target - self.jaw[side]
-            if delta:
-                moves.append(_Move(self._finger_id(side), delta, rpm, FINGER_POSITION_ACCEL))
-        self._sync(moves)
-        self.jaw["R"] = targets["R"]
-        self.jaw["L"] = targets["L"]
-        if requested_target == JAW_CLAMP:
-            self._recover_clamp_overflow(("R", "L"))
-
-    def _coupled_turn(self, side: str, angle: int, rpm: int):
-        if angle not in (-180, -90, 90, 180):
-            raise MotionError("turn angle must be +/-90 or +/-180")
-        rpm = self.bus._validate_rpm(rpm)
-        # Keep the finger RPM exactly half of the arm RPM.
-        if rpm & 1:
-            rpm -= 1
-        if rpm < MIN_RPM:
-            rpm = MIN_RPM if MIN_RPM % 2 == 0 else MIN_RPM + 1
-        arm_delta = int(angle / 90) * ARM_90_PULSES
-        if not self._single_arm_collision_allowed(side, arm_delta):
-            raise MotionError("arm collision guard rejected %s %d-degree turn" % (side, angle))
-
-        finger_delta = arm_delta // 2
-        self._sync((
-            _Move(self._finger_id(side), finger_delta, max(MIN_RPM, rpm // 2), FINGER_POSITION_ACCEL),
-            _Move(self._arm_id(side), arm_delta, rpm, ARM_POSITION_ACCEL),
-        ))
-        self.arm[side] += arm_delta
-
-    def _arm_back(self, side: str, close_after: bool = True):
-        """Open for clearance, +90 with belt following, optionally re-clamp."""
-        self._move_jaw(side, JAW_NO_LOAD, V_FINGER)
-        self._coupled_turn(side, +90, V_NO_LOAD)
-        if close_after:
-            self._move_jaw(side, JAW_CLAMP, V_FINGER)
-
-    def _flip_adjust(self, flip_side: str, angle: int):
-        """Direct four-axis version of the v1.2 FLIP_ADJUST primitive."""
-        if angle not in (-180, -90, 90):
-            raise MotionError("FLIP_ADJUST angle must be -180, -90 or +90")
-
-        # Re-read all encoders before the compound action so host state cannot
-        # silently drift after a reset or interrupted previous trajectory.
-        self._reconcile_from_encoders()
-
-        no_load_side = "R" if flip_side == "L" else "L"
-        self._move_jaw(no_load_side, JAW_NO_LOAD, V_FINGER)
-
-        no_load_delta = ARM_90_PULSES
-        flip_delta = (-2 if angle == -180 else int(angle / 90)) * ARM_90_PULSES
-        if not self._pair_collision_allowed(no_load_side, no_load_delta, flip_side, flip_delta):
-            raise MotionError("arm collision guard rejected FLIP_ADJUST")
-
-        moves = (
-            _Move(self._finger_id(no_load_side), no_load_delta // 2,
-                  max(MIN_RPM, V_NO_LOAD // 2), FINGER_POSITION_ACCEL),
-            _Move(self._arm_id(no_load_side), no_load_delta,
-                  V_NO_LOAD, ARM_POSITION_ACCEL),
-            _Move(self._finger_id(flip_side), flip_delta // 2,
-                  max(MIN_RPM, V_FLIP // 2), FINGER_POSITION_ACCEL),
-            _Move(self._arm_id(flip_side), flip_delta,
-                  V_FLIP, ARM_POSITION_ACCEL),
-        )
-        self._sync(moves, timeout=8.0)
-        self.arm[no_load_side] += no_load_delta
-        self.arm[flip_side] += flip_delta
-        self._move_jaw(no_load_side, JAW_CLAMP, V_FINGER)
-
-    # ------------------------- drop-in public methods -------------------------
-
-    def emergency_stop(self):
-        try:
-            self.bus.stop_all()
-        finally:
-            try:
-                self.bus.enable_all(False)
-            except Exception:
-                pass
+    
+    def move_two_finger_raw(self, target, current):
+        self.finger_offset[0] = target
+        self.finger_offset[1] = target
+        # 手臂目标位置 = arm_zero + arm_offset
+        # 手指目标位置 = finger_zero + arm_offset / 2 + finger_offset
+        finger1 = self.finger_zero[0] + self.arm_offset[0] // 2 + self.finger_offset[0]
+        finger3 = self.finger_zero[1] + self.arm_offset[1] // 2 + self.finger_offset[1]
+        cmd_trap(self.ser, [1, 3], False, 
+                 [[finger1, 0, V_FINGER, A_FINGER, current], 
+                  [finger3, 0, V_FINGER, A_FINGER, current]])
+        cmd_wait_motion(self.ser, 3)
 
     def two_finger_init(self):
-        return self._move_both_jaws(JAW_RELEASE, V_FINGER)
+        self.move_two_finger_raw(FINGER_INIT, MAX_CURRENT)
 
     def two_finger_clamp(self):
-        return self._move_both_jaws(JAW_CLAMP, V_FINGER)
+        self.move_two_finger_raw(FINGER_CLAMP, CLAMP_CURRENT)
+    
+    # def two_finger_max_raw(self):
+    #     self.move_two_finger(FINGER_MAX, MAX_CURRENT)
+    
+    # 旋转机械臂，当wait达到设定角度后返回，如果wait=0，则等待整个控制过程结束再返回
+    # angle 只能是90度的整数倍，且不能为0
+    def move_arm(self, angle ,left, finger_current, speed, accel, wait = 0):
+        if left:
+            id_list = [3, 4]
+            index = 1
+        else:
+            id_list = [1, 2]
+            index = 0
+        # 手臂旋转电机目前位置
+        arm_now = self.arm_zero[index] + self.arm_offset[index]
+        # 计算函数返回时的电机位置
+        arm_ret = self.arm_zero[index] + self.arm_offset[index] + 8192 * (wait / 90.0)
+        # 更新手臂位置
+        self.arm_offset[index] += 8192 * (angle // 90)
+        # 手臂目标位置 = arm_zero + arm_offset
+        arm_target = self.arm_zero[index] + self.arm_offset[index]
+        # 存在齿轮，所以需要和手臂电机旋转方向相反，转速绝对值相同，才能保证相对静止
+        # 手指目标位置 = finger_zero + arm_offset / 2 + finger_offset
+        # 计算手指电机的目标位置
+        finger_sign = 1 if index == 0 else -1
+        finger_target = self.finger_zero[index] + finger_sign * self.arm_offset[index] // 2 + self.finger_offset[index]
+
+        cmd_trap(self.ser, id_list, False, 
+                 [[finger_target, 0, speed, accel, finger_current], 
+                  [arm_target, 0, 2*speed, 2*accel, MAX_CURRENT]])
+        if wait == 0:
+            real_pos = cmd_wait_motion(self.ser, id_list[1])
+            cmd_wait_motion(self.ser, id_list[0])
+            self.check_arm_pos(real_pos, arm_target, id_list[1])
+        else:
+            self.wait_motion_by_pos(id_list[1], arm_now, arm_ret, arm_target)
+            cmd_wait_motion(self.ser, id_list[0])
+
+    def move_arm_without_finger(self, angle ,left, speed, accel):
+        if left:
+            id_list = [4]
+            index = 1
+        else:
+            id_list = [2]
+            index = 0
+        # 更新手臂位置
+        self.arm_offset[index] += 8192 * (angle // 90)
+        # 手臂目标位置 = arm_zero + arm_offset
+        arm_target = self.arm_zero[index] + self.arm_offset[index]
+        cmd_trap(self.ser, id_list, False, 
+                 [[arm_target, 0, 2*speed, 2*accel, MAX_CURRENT]])
+        # 等待动作完成
+        real_pos = cmd_wait_motion(self.ser, id_list[0])
+        self.check_arm_pos(real_pos, arm_target, id_list[0])
+
+    def wait_motion_by_pos(self, id, now, ret, target):
+        logger.debug("等待%d号电机超过指定位置", id)
+        logger.debug("%d --> %d(在此处返回) --> %d", now, ret, target)
+        start_time = time.time()
+        while(True):
+            pos = cmd_get_pos(self.ser, id)
+            end_time = time.time()
+            if end_time - start_time > ARM_MOTION_TIME_OUT:
+                logger.error(f"运动控制超时，可能是出现了电机堵转问题")
+                cmd_enable(self.ser, [1,2,3,4], 0)
+                logger.error(f"关闭全部电机")
+                raise ValueError('运动控制超时')
+            if target > now and pos > ret:
+                break
+            if target < now and pos < ret:
+                break
+
+        logger.debug("耗时: %.2fms", 1000*(end_time - start_time))
+
+    # 手指伸缩，当wait达到设定位置后返回，如果wait=0，则等待整个控制过程结束再返回
+    def move_single_finger_raw(self, left, pos, speed, accel, current, wait = 0):
+        if left:
+            id_list = [3]
+            index = 1
+        else:
+            id_list = [1]
+            index = 0
+        
+        if self.finger_offset[index] == pos:
+            logger.error("手指已经处于该位置")
+            return
+
+        # 手指电机目前位置
+        finger_now = self.finger_zero[index] + self.arm_offset[index] // 2 + self.finger_offset[index]
+        # 计算函数返回时的电机位置
+        finger_ret = self.finger_zero[index] + self.arm_offset[index] // 2 + wait
+        # 计算手指电机的目标位置
+        self.finger_offset[index] = pos
+        finger_target = self.finger_zero[index] + self.arm_offset[index] // 2 + self.finger_offset[index]
+        cmd_trap(self.ser, id_list, False, [[finger_target, 0, speed, accel, current]])
+        if wait == 0:
+            cmd_wait_motion(self.ser, id_list[0])
+        else:
+            self.wait_motion_by_pos(id_list[0], finger_now, finger_ret, finger_target)
+    def move_finger_lock(self, left):
+        self.move_single_finger_raw(left, FINGER_CLAMP, V_FINGER, A_FINGER, CLAMP_CURRENT, 0)
 
     def move_finger_init(self, left):
-        return self._move_jaw(self._side_from_bool(left), JAW_RELEASE, V_FINGER)
-
-    def move_finger_lock(self, left):
-        return self._move_jaw(self._side_from_bool(left), JAW_CLAMP, V_FINGER)
-
-    def move_finger_flip(self, left, wait=0):
-        # The direct backend completes the checked move before returning. This
-        # is intentionally more conservative than the old early-return timing.
-        del wait
-        return self._move_jaw(self._side_from_bool(left), JAW_RELEASE, V_FINGER)
+        self.move_single_finger_raw(left, FINGER_INIT, V_FINGER, A_FINGER, MAX_CURRENT, 0)
+        
+    def move_finger_flip(self, left, wait = 0):
+        self.move_single_finger_raw(left, FINGER_FLIP, V_FINGER, A_FINGER, MAX_CURRENT, wait)
 
     def arm_90_no_load(self, left, no_finger_return=False):
-        return self._arm_back(self._side_from_bool(left), close_after=not no_finger_return)
-
-    def move_arm(self, angle, left, finger_current=None, speed=V_TWIST, accel=None, wait=0):
-        del finger_current, accel, wait
-        return self._coupled_turn(self._side_from_bool(left), int(angle), int(speed))
-
-    def move_arm_without_finger(self, angle, left, speed=V_NO_LOAD, accel=None):
-        # On the synchronous-belt mechanism an arm-only electrical move would
-        # change the jaw opening. Always preserve the mechanical jaw coordinate
-        # by moving the paired finger at half travel.
-        del accel
-        return self._coupled_turn(self._side_from_bool(left), int(angle), int(speed))
-
-    def recover_horizontal(self):
-        """Best-effort direct-TTL recovery to the recorded horizontal arms."""
-        self.bus.stop_all()
-        for motor_id in MOTOR_IDS:
-            try:
-                self.bus.clear_stall(motor_id)
-            except Exception:
-                pass
-        self.bus.enable_all(True)
-        self._reconcile_from_encoders()
-
-        for side in ("R", "L"):
-            tries = 0
-            while abs(self.arm[side]) > POSITION_TOLERANCE_PULSES and tries < 8:
-                delta = -self.arm[side]
-                delta = max(-ARM_90_PULSES, min(ARM_90_PULSES, delta))
-                if delta & 1:
-                    delta -= 1
-                if delta == 0:
-                    break
-                angle_like = delta
-                if not self._single_arm_collision_allowed(side, delta):
-                    raise MotionError("collision guard rejected horizontal recovery")
-                self._sync((
-                    _Move(self._finger_id(side), delta // 2,
-                          max(MIN_RPM, V_NO_LOAD // 2), FINGER_POSITION_ACCEL),
-                    _Move(self._arm_id(side), delta, V_NO_LOAD, ARM_POSITION_ACCEL),
-                ))
-                self.arm[side] += angle_like
-                tries += 1
-
-        self._reconcile_from_encoders()
-        if abs(self.arm["R"]) > POSITION_TOLERANCE_PULSES or abs(self.arm["L"]) > POSITION_TOLERANCE_PULSES:
-            raise MotionError("unable to recover both arms to horizontal reference")
-        return True
-
-    # ------------------------- optimizer token execution -------------------------
-
-    def _basic(self, token: str):
-        if len(token) < 2 or token[0] not in ("L", "R"):
-            raise MotionError("invalid motion token %r" % token)
-        side = token[0]
-        op = token[1:]
-
-        if op == "0":
-            self._move_jaw(side, JAW_CLAMP, V_FINGER)
-        elif op == "1":
-            self._move_jaw(side, JAW_RELEASE, V_FINGER)
-        elif op == "2":
-            raise MotionError("%s must be grouped with %s+N" % (token, side))
-        elif op == "+N":
-            raise MotionError("%s must be grouped with a preceding %s2" % (token, side))
-        elif op in ("+T", "+F"):
-            self._coupled_turn(side, +90, V_TWIST if op.endswith("T") else V_FLIP)
-        elif op in ("-T", "-F"):
-            self._coupled_turn(side, -90, V_TWIST if op.endswith("T") else V_FLIP)
-        elif op in ("*T", "*F"):
-            self._coupled_turn(side, -180, V_TWIST if op.endswith("T") else V_FLIP)
+        # 只支持固定的方向
+        angle = 90
+        self.move_finger_init(left)
+        # 本侧手指松开（这里还可以优化，可用尝试边松开手指，边空转90度）
+        if left:
+            id_list = [3]
+            index = 1
         else:
-            raise MotionError("unsupported motion token %s" % token)
+            id_list = [1]
+            index = 0
+        if self.finger_offset[index] != FINGER_INIT:
+            logger.warning("finger_offset[index] != FINGER_INIT")
+        # 手指电机目前位置
+        finger_now    = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_INIT
+        # 计算函数返回时的电机位置
+        finger_ret    = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_NO_LOAD_START_ARM
+        # 计算手指电机的目标位置
+        arm_90_deg = round(8192 / 2)
+        arm_20_deg = round(8192 * (20/90) / 2)
+        arm_70_deg = round(8192 * (70/90) / 2)
 
-    def motions(self, actions: Sequence[str] | str):
-        """Execute cube_optimizer tokens with longest-match compound parsing."""
-        if isinstance(actions, str):
-            tokens = actions.split()
+        if no_finger_return == False:
+            finger_target_stage_1 = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_MAX
+            finger_target_stage_1 += arm_20_deg
+            finger_target_stage_2 = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_MAX
+            finger_target_stage_2 += arm_70_deg
+            finger_target_stage_3 = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_INIT
+            finger_target_stage_3 += arm_90_deg
+            
+            cmd_trap(self.ser, id_list, False, 
+                    [[finger_target_stage_1, V_NO_LOAD_20_70_DEG//2, V_FINGER, A_FINGER, MAX_CURRENT]])
+            cmd_trap(self.ser, id_list, False, 
+                    [[finger_target_stage_2, V_NO_LOAD_20_70_DEG//2, V_NO_LOAD, A_NO_LOAD, MAX_CURRENT]])
+            cmd_trap(self.ser, id_list, False, 
+                    [[finger_target_stage_3, 0                     , V_FINGER, A_FINGER, MAX_CURRENT]])
         else:
-            tokens = [str(x).strip() for x in actions if str(x).strip()]
+            finger_target_stage_1 = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_MAX
+            finger_target_stage_1 += arm_20_deg
+            finger_target_stage_2 = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_MAX
+            finger_target_stage_2 += arm_90_deg
+            self.finger_offset[index] = FINGER_MAX
 
-        i = 0
-        try:
-            while i < len(tokens):
-                started = time.monotonic()
+            cmd_trap(self.ser, id_list, False, 
+                    [[finger_target_stage_1, V_NO_LOAD_20_70_DEG//2, V_FINGER, A_FINGER, MAX_CURRENT]])
+            cmd_trap(self.ser, id_list, False, 
+                    [[finger_target_stage_2, 0                     , V_NO_LOAD, A_NO_LOAD, MAX_CURRENT]])
+        # 等待手指到达指定位置
+        self.wait_motion_by_pos(id_list[0], finger_now, finger_ret, finger_target_stage_1)
+        # 空转90度
+        self.move_arm_without_finger(angle, left, V_NO_LOAD, A_NO_LOAD)
+        if no_finger_return == False:
+            # 等待手指归位
+            cmd_wait_motion(self.ser, id_list[0])
+            # 手指锁紧
+            self.move_finger_lock(left)
 
-                # Four-token FLIP_ADJUST must be recognized before shorter
-                # matches. It is one synchronized four-axis native TTL move.
-                if i + 4 <= len(tokens):
-                    key4 = tuple(tokens[i:i + 4])
-                    compound = _FOUR_TOKEN.get(key4)
-                    if compound is not None:
-                        flip_side, angle = compound
-                        logger.info("TTL compound: %s -> FLIP_ADJUST", " ".join(key4))
-                        self._flip_adjust(flip_side, angle)
-                        i += 4
-                        continue
+    def motions(self, actions):
+        i = 0 
+        while i < len(actions):
+            start_time = time.time()
+            action = actions[i]
+            i += 1
+            # action[0]取值范围L、R
+            if action[0] == 'L':
+                left = LEFT
+            elif action[0] == 'R':
+                left = RIGHT
+            else:
+                logger.error(f"未知指令 {action}")
+                return
+            # action[1]取值范围0、1、2、+、-、*
+            if action[1] == '0':
+                # 夹爪夹紧操作，如果去掉move_finger_init，也可以还原，但是稳定性稍差，时间能减少10ms左右
+                self.move_finger_init(left)
+                self.move_finger_lock(left)
+            elif action[1] == '1':
+                # 夹爪张开，下一步一定是翻面操作，松到与魔方表面齐平就可以下一步了
+                self.move_finger_flip(left, FINGER_FLIP_WAIT)
+            elif action[1] == '2':
+                # 夹爪张开最大角度，这个涉及同侧电机联动问题，2-3条指令合并处理
+                # 加载后面的两条指令
+                if i < len(actions):
+                    action_arm = actions[i] # R+N
+                else:
+                    logger.error(f"{action}不能位于序列末尾")
+                    return
+                if i+1 < len(actions):
+                    action_finger = actions[i+1]
+                else:
+                    action_finger = 'XXX'
 
-                if i + 3 <= len(tokens):
-                    key3 = tuple(tokens[i:i + 3])
-
-                    arm_back_side = _ARM_BACK_THREE.get(key3)
-                    if arm_back_side is not None:
-                        logger.info("TTL compound: %s -> ARM_BACK", " ".join(key3))
-                        self._arm_back(arm_back_side, close_after=True)
-                        i += 3
-                        continue
-
-                    flip = _FLIP_THREE.get(key3)
-                    if flip is not None:
-                        turn_side, angle = flip
-                        support_side = "R" if turn_side == "L" else "L"
-                        logger.info("TTL compound: %s -> FLIP", " ".join(key3))
-                        self._move_jaw(support_side, JAW_RELEASE, V_FINGER)
-                        self._coupled_turn(turn_side, angle, V_FLIP)
-                        self._move_jaw(support_side, JAW_CLAMP, V_FINGER)
-                        i += 3
-                        continue
-
-                # R2 R+N / L2 L+N with no same-side trailing 0: execute the
-                # no-load turn and intentionally leave that jaw open.
-                if i + 2 <= len(tokens):
-                    first, second = tokens[i], tokens[i + 1]
-                    if (
-                        len(first) >= 2
-                        and first[0] in ("L", "R")
-                        and first[1:] == "2"
-                        and second == first[0] + "+N"
-                    ):
-                        logger.info("TTL compound: %s %s -> ARM_BACK(open)", first, second)
-                        self._arm_back(first[0], close_after=False)
+                if action_arm[1:] == '+N':
+                    if action_finger[1:] == '0':
+                        self.arm_90_no_load(left, False) # 完成后手指夹紧
                         i += 2
-                        continue
+                    else:
+                        self.arm_90_no_load(left, True)  # 完成后手指松开
+                        i += 1
+                else:
+                    logger.error(f"{action}的下一条指令必须为R+N, 实际为{action_arm}")
+                    return
 
-                token = tokens[i]
-                self._basic(token)
-                i += 1
-                logger.info(
-                    "TTL token %d/%d %s completed in %.1f ms",
-                    i, len(tokens), token,
-                    (time.monotonic() - started) * 1000.0,
-                )
+            elif action[1] in ('+', '-', '*'):
+                op = action[1:]
+                if  op == '*T':
+                    # 转动-180°，等到旋转-170°时，开始手指归位操作
+                    self.move_arm(-180, left, CLAMP_CURRENT, V_TWIST, A_TWIST, -170)
+                elif op == '+T':
+                    # 转90°，等到旋转80°时，开始手指归位操作
+                    self.move_arm(90, left, CLAMP_CURRENT, V_TWIST, A_TWIST, 80)
+                elif op == '-T':
+                    # 转-90°，等到旋转-80°时，开始手指归位操作
+                    self.move_arm(-90, left, CLAMP_CURRENT, V_TWIST, A_TWIST, -80)
+                elif op == '*F':
+                    # 旋转-180°
+                    self.move_arm(-180, left, CLAMP_CURRENT, V_FLIP, A_FLIP)
+                elif op == '+F':
+                    # 转90°
+                    self.move_arm(90, left, CLAMP_CURRENT, V_FLIP, A_FLIP)
+                elif op == '-F':
+                    # 转-90°
+                    self.move_arm(-90, left, CLAMP_CURRENT, V_FLIP, A_FLIP)
+                else:
+                    logger.error(f"未知指令 {action}")
+                    return
+            else:
+                logger.error(f"未知指令 {action}")
+                return
+            logger.info(f"序号{i}，处理指令{action}，耗时{1000 * (time.time() - start_time):.1f}ms")
 
-            return True
+            
 
-        except Exception:
-            logger.exception("direct TTL motion sequence aborted")
-            try:
-                self.bus.stop_all()
-            except Exception:
-                logger.exception("emergency stop also failed")
-            raise
-
-
-# ---------------------------------------------------------------------------
-# Direct hardware test
-# ---------------------------------------------------------------------------
-
-def _main():
-    port = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SERIAL_PORT
-    try:
-        with serial.Serial(
-            port,
-            baudrate=BAUD_RATE,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=0.02,
-        ) as ser:
-            print("Direct EMM-V5 TTL bus connected:", port)
-            print("Motor map: 1=right arm, 2=right finger, 3=left arm, 4=left finger")
-            print("Place both arms horizontal/reference and fingers at normal clamp.")
-            input("Press Enter to record the current encoder positions as zero... ")
-
-            zero = cmd_zero(ser)
-            mc = MotionCtrl(ser, *zero)
-
-            while True:
-                command = input("motion ('R+T R-T', open, clamp, verify, recover, q) > ").strip()
-                if command.lower() in ("q", "quit", "exit"):
-                    break
-                if command.lower() == "open":
-                    mc.two_finger_init()
-                elif command.lower() == "clamp":
-                    mc.two_finger_clamp()
-                elif command.lower() == "verify":
-                    print(mc.verify_all())
-                elif command.lower() == "recover":
-                    mc.recover_horizontal()
-                elif command:
-                    mc.motions(command)
-
-            mc.emergency_stop()
-
-    except serial.SerialException as exc:
-        logger.error("cannot open TTL serial port %s: %s", port, exc)
-        list_serial_ports()
-        raise SystemExit(1)
-    except KeyboardInterrupt:
-        print()
-
+# ------------------------------- 以下是测试程序 -------------------------------
+def list_serial_ports():
+    """列出可用串口"""
+    ports = list_ports.comports()
+    if not ports:
+        print("未检测到可用串口设备")
+        return
+    print("可用串口设备:")
+    for port in ports:
+        print(f"  {port.device} - {port.description}")
 
 if __name__ == "__main__":
-    _main()
+    if len(sys.argv) > 1:
+        serial_port = sys.argv[1]
+    else:
+        serial_port = DEFAULT_SERIAL_PORT  # 默认值
+
+    mc = None
+    try:
+        with serial.Serial(serial_port, baudrate = BAUD_RATE, bytesize=serial.EIGHTBITS,
+                        parity=serial.PARITY_NONE, stopbits=serial.STOPBITS_ONE) as ser0:
+            print("\n串口连接成功，进入交互模式")
+            while True:
+                print("\n请选择测试项目:")
+                print("[1]: 使能全部电机")
+                print("[2]: 禁用全部电机")
+                print("[3]: 查询电机角度")
+                print("[4]: 回零点(需要先回零点才能执行其他的！)")
+                print("[5]: 松开魔方")
+                print("[6]: 夹紧魔方")
+                print("[7]: 预留")
+                print("[8]: 测试旋转臂动作")
+                print("[9]: 打乱魔方再还原")
+                print("[q]: 退出程序")
+                
+                choice = input("请输入选项(1/2/q/...) >> ").strip().lower()
+                
+                if choice in ['exit', 'quit', 'q']:
+                    print("退出程序...")
+                    break
+                elif choice == '1':
+                    success = cmd_enable(ser0, [1,2,3,4], 1)
+                    print("执行结果:", "成功" if success else "失败")
+                elif choice == '2':
+                    success = cmd_enable(ser0, [1,2,3,4], 0)
+                    print("执行结果:", "成功" if success else "失败")
+                elif choice == '3':
+                    exit = False
+                    pos = [None] * 4
+                    for id in (1,2,3,4):
+                        resp = cmd_stat(ser0, id)
+                        if resp == None:
+                            print(f"未收到控制器回复，控制器编号={id}")
+                            exit = True
+                        else:
+                            pos[id-1] = resp[3]
+                    print(f"当前电机角度: {pos}")
+                elif choice == '4':
+                    zero = cmd_zero(ser0)
+                    mc = MotionCtrl(ser0, zero[0], zero[1], zero[2], zero[3])
+                    mc.two_finger_init()
+                elif choice == '5':
+                    mc.two_finger_init()
+                elif choice == '6':
+                    mc.two_finger_clamp()
+                elif choice == '7':
+                    pass
+                elif choice == '8':
+                    mc.two_finger_clamp()
+                    mc.motions(['R1', 'L*F', 'R0',   'L1', 'R+F', 'L0',   'R2', 'R+N', 'R0'])
+                    mc.motions(['L1', 'R*F', 'L0',   'R1', 'L+F', 'R0',   'L2', 'L+N', 'L0'])
+                    mc.two_finger_init()
+                elif choice == '9':
+                    mc.two_finger_clamp()
+                    scramble_string_a = "L1 R-F L0 R2 R+N R0 L+T R1 L+F R0 R-T R2 R+N R0 L*T L1 R-F L0 R2 R+N R0 L-T L2 L+N R*F L0 L-T L2 L+N L0 R*T L1 R*F L0 L*T R*T L1 R+F L0 R2 R+N R0 L*T R*T R1 L-F R0 L2 L+N L0 R-T R2 R+N R0 L*T L1 R-F L0 R2 R+N R0 L*T R-T R2 R+N R0 L-T R1 L+F R0 R-T R2 R+N L+F R0 L2 L+N L0 R*T L-T R1 L-F R0 R-T L1 R*F L0 R2 R+N R0 L+T L2 L+N L0 R+T R2 R+N R0"
+                    time_start = time.time()
+                    mc.motions(scramble_string_a.split(' '))
+                    logger.info(f"time = {time.time() - time_start:.2f}s")
+                    mc.two_finger_init()
+                else:
+                    print("无效选项，请重新输入")
+
+
+    except serial.SerialException as e:
+        logger.error(f"打开串口 {serial_port} 失败: {str(e)}")
+        list_serial_ports()
+        sys.exit(1)
+    except KeyboardInterrupt:
+        logger.info("程序被用户中断")

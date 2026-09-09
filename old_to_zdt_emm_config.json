@@ -1,0 +1,53 @@
+{
+  "old_full_scale_current_ma": 2500,
+  "telemetry_cache_s": 0.5,
+  "zdt_timeout_s": 0.1,
+  "motors": {
+    "1": {
+      "zdt_id": 2,
+      "direction": -1,
+      "encoder_offset_counts": 0,
+      "reach_tolerance_counts": 64,
+      "zero_motion_epsilon_counts": 8,
+      "zero_stall_ms": 80,
+      "zero_min_run_ms": 80,
+      "zero_use_zdt_stall_flag": false,
+      "emm_pulses_per_rev": 3200,
+      "command_direction": -1
+    },
+    "2": {
+      "zdt_id": 1,
+      "direction": -1,
+      "encoder_offset_counts": 0,
+      "reach_tolerance_counts": 64,
+      "zero_motion_epsilon_counts": 8,
+      "zero_stall_ms": 80,
+      "zero_min_run_ms": 80,
+      "zero_use_zdt_stall_flag": false,
+      "emm_pulses_per_rev": 3200,
+      "command_direction": 1
+    },
+    "3": {
+      "zdt_id": 4,
+      "direction": 1,
+      "encoder_offset_counts": 0,
+      "reach_tolerance_counts": 64,
+      "zero_motion_epsilon_counts": 8,
+      "zero_stall_ms": 80,
+      "zero_min_run_ms": 80,
+      "zero_use_zdt_stall_flag": false,
+      "emm_pulses_per_rev": 3200
+    },
+    "4": {
+      "zdt_id": 3,
+      "direction": 1,
+      "encoder_offset_counts": 0,
+      "reach_tolerance_counts": 64,
+      "zero_motion_epsilon_counts": 8,
+      "zero_stall_ms": 80,
+      "zero_min_run_ms": 80,
+      "zero_use_zdt_stall_flag": false,
+      "emm_pulses_per_rev": 3200
+    }
+  }
+}
