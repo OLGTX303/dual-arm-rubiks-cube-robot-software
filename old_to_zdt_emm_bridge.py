@@ -230,6 +230,7 @@ def decode_old_frame(frame: bytes) -> List[OldBlock]:
 class MotorConfig:
     zdt_id: int
     direction: int = 1
+    command_direction: int = 1
     encoder_offset_counts: int = 0
     reach_tolerance_counts: int = 64
     zero_motion_epsilon_counts: int = 8
@@ -266,23 +267,11 @@ class BridgeConfig:
             for key, item in raw["motors"].items():
                 old_id = int(key)
                 direction = 1 if int(item.get("direction", 1)) >= 0 else -1
-                if "command_direction" in item:
-                    # Feedback sign and command sign describe the SAME physical
-                    # relationship, so they cannot differ: old position is
-                    # derived as origin + delta_zdt_deg * direction, hence a
-                    # commanded delta must be sent with that same sign. A
-                    # mismatch makes the motor run away from its target until
-                    # cube_motion.check_arm_pos() trips 运动控制超时.
-                    legacy = 1 if int(item["command_direction"]) >= 0 else -1
-                    if legacy != direction:
-                        LOG.warning(
-                            "motor %d: ignoring command_direction=%+d which "
-                            "contradicts direction=%+d; using direction. Flip "
-                            "\"direction\" if this motor turns the wrong way.",
-                            old_id, legacy, direction)
+                command_direction = 1 if int(item.get("command_direction", direction)) >= 0 else -1
                 cfg.motors[old_id] = MotorConfig(
                     zdt_id=int(item.get("zdt_id", old_id)),
                     direction=direction,
+                    command_direction=command_direction,
                     encoder_offset_counts=int(item.get("encoder_offset_counts", 0)),
                     reach_tolerance_counts=int(item.get("reach_tolerance_counts", 64)),
                     zero_motion_epsilon_counts=int(item.get("zero_motion_epsilon_counts", 8)),
@@ -578,7 +567,7 @@ class OldToZDTTranslator:
         # avoids requiring ZDT's internal coordinate zero to match the old board.
         c = self._mcfg(old_id)
         delta_old = m.target_counts - current_old
-        signed_zdt_delta = delta_old * c.direction
+        signed_zdt_delta = delta_old * c.command_direction
         direction = 0x00 if signed_zdt_delta >= 0 else 0x01
         pulses = clamp_int(
             abs(delta_old) * max(1, c.emm_pulses_per_rev) / OLD_COUNTS_PER_REV,

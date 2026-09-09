@@ -6,6 +6,7 @@
     "1": {
       "zdt_id": 2,
       "direction": -1,
+      "command_direction": -1,
       "encoder_offset_counts": 0,
       "reach_tolerance_counts": 64,
       "zero_motion_epsilon_counts": 8,
@@ -17,6 +18,7 @@
     "2": {
       "zdt_id": 1,
       "direction": -1,
+      "command_direction": 1,
       "encoder_offset_counts": 0,
       "reach_tolerance_counts": 64,
       "zero_motion_epsilon_counts": 8,
@@ -27,7 +29,8 @@
     },
     "3": {
       "zdt_id": 4,
-      "direction": 1,
+      "direction": -1,
+      "command_direction": -1,
       "encoder_offset_counts": 0,
       "reach_tolerance_counts": 64,
       "zero_motion_epsilon_counts": 8,
