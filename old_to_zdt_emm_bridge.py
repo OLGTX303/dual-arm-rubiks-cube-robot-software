@@ -789,6 +789,14 @@ class OldToZDTTranslator:
         # the motors disabled. Enable/disable each address immediately.
         for old_id, en in parsed:
             c = self._mcfg(old_id)
+            if not en:
+                # Disabling alone does not reliably cancel an already queued
+                # Emm trajectory. Stop first so cube claim/release cannot let
+                # a previously commanded arm continue rotating.
+                try:
+                    self.zdt.stop(c.zdt_id, 0)
+                except ZDTError:
+                    pass
             self.zdt.enable(c.zdt_id, en, 0)
             if not en:
                 r = self._runtime(old_id)
