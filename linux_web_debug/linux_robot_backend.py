@@ -108,7 +108,9 @@ def do_hw(cmd):
                 elif cmd=='disable_all': result=legacy.cmd_enable(s,[1,2,3,4],False)
                 elif cmd=='go_home': result=legacy.cmd_zero(s) is not None
                 elif cmd in ('release_cube','clamp_cube'):
-                    refs=legacy.cmd_zero(s)
+                    # Cube claim/release must not rotate either arm.  Home only
+                    # the fingers, then apply the original open/close target.
+                    refs=legacy.cmd_zero_fingers_only(s)
                     mc=legacy.MotionCtrl(s,*refs)
                     mc.two_finger_init() if cmd == 'release_cube' else mc.two_finger_clamp()
                     result=True

@@ -332,6 +332,39 @@ def cmd_zero(ser):
     
     return (finger1_pos, arm2_pos, finger3_pos, arm4_pos)
 
+def cmd_zero_fingers_only(ser):
+    """Home/retract the fingers without commanding either rotation arm."""
+    current = 15
+    accel = 20
+    speed_slow = 30
+
+    # Disable all drives, then re-enable only the two finger drives.
+    cmd_enable(ser, [1, 2, 3, 4], 0)
+    cmd_enable(ser, [1, 3], True)
+
+    finger1_old = cmd_get_pos(ser, 1)
+    cmd_trap(ser, [1], True, [[finger1_old - 10000, 0, speed_slow, accel, current]])
+    finger1 = cmd_wait_motion(ser, 1)
+    if abs(finger1 - finger1_old) > 10500:
+        raise ValueError("right finger homing distance too long")
+    finger1 += OFFSET_FINGER_1_ZERO
+    cmd_trap(ser, [1], False, [[finger1, 0, speed_slow, accel, MAX_CURRENT]])
+    cmd_wait_motion(ser, 1)
+
+    finger3_old = cmd_get_pos(ser, 3)
+    cmd_trap(ser, [3], True, [[finger3_old - 10000, 0, speed_slow, accel, current]])
+    finger3 = cmd_wait_motion(ser, 3)
+    if abs(finger3 - finger3_old) > 10500:
+        raise ValueError("left finger homing distance too long")
+    finger3 += OFFSET_FINGER_3_ZERO
+    cmd_trap(ser, [3], False, [[finger3, 0, speed_slow, accel, MAX_CURRENT]])
+    cmd_wait_motion(ser, 3)
+
+    # Read arm positions only; no arm movement command is sent.
+    arm2 = cmd_get_pos(ser, 2)
+    arm4 = cmd_get_pos(ser, 4)
+    return (finger1, arm2, finger3, arm4)
+
 # ------------------------------- 以下是运动控制代码 -------------------------------
 LEFT          = True
 RIGHT         = False
