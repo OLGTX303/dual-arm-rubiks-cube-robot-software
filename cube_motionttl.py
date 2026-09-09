@@ -21,7 +21,16 @@ import sys
 import emm_v5_adapter as _emm
 
 
-_ORIGINAL_PATH = Path(__file__).resolve().parent.parent / "software" / "cube_motion.py"
+_HERE = Path(__file__).resolve().parent
+# cube_motion.py normally sits next to this file; the ../software/ layout is the
+# historical location kept as a fallback.
+_CANDIDATES = (_HERE / "cube_motion.py", _HERE.parent / "software" / "cube_motion.py")
+_ORIGINAL_PATH = next((p for p in _CANDIDATES if p.is_file()), None)
+if _ORIGINAL_PATH is None:
+    raise ImportError(
+        "Cannot find the original cube_motion.py; looked in: "
+        + ", ".join(str(p) for p in _CANDIDATES))
+
 _spec = importlib.util.spec_from_file_location("cube_motion_original_v11", _ORIGINAL_PATH)
 if _spec is None or _spec.loader is None:
     raise ImportError(f"Cannot load original cube motion module: {_ORIGINAL_PATH}")

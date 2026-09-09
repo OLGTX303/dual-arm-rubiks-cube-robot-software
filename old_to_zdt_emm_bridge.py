@@ -22,7 +22,12 @@ Important compatibility choices
 * Keep ZDT Response mode = Receive.
 * For closest old ZERO behavior, set ZDT Clog_Pro = Disable. The bridge does
   its own software stall detection and sends FE 98 stop, so ZDT coordinates
-  are not reset by the built-in homing command.
+  are not reset by the built-in homing command. If Clog_Pro is left enabled,
+  the bridge clears the latched protection (0E 52) and re-enables the motor
+  after an emulated ZERO stall, because the old controller had no such latch.
+* A motor's "direction" is a single physical fact, so it is applied to both
+  the 0x36 feedback and the FD direction bit. A legacy "command_direction"
+  key that disagrees with it is ignored with a warning.
 * The old controller has a FIFO and a terminal-velocity v1 field. This bridge
   queues old TRAP commands, but ZDT Emm FD has no exact v1 equivalent; v1 is
   kept for diagnostics and otherwise ignored. Queued segments therefore may
@@ -225,7 +230,6 @@ def decode_old_frame(frame: bytes) -> List[OldBlock]:
 class MotorConfig:
     zdt_id: int
     direction: int = 1
-    command_direction: int = 1
     encoder_offset_counts: int = 0
     reach_tolerance_counts: int = 64
     zero_motion_epsilon_counts: int = 8
@@ -261,10 +265,24 @@ class BridgeConfig:
             cfg.motors = {}
             for key, item in raw["motors"].items():
                 old_id = int(key)
+                direction = 1 if int(item.get("direction", 1)) >= 0 else -1
+                if "command_direction" in item:
+                    # Feedback sign and command sign describe the SAME physical
+                    # relationship, so they cannot differ: old position is
+                    # derived as origin + delta_zdt_deg * direction, hence a
+                    # commanded delta must be sent with that same sign. A
+                    # mismatch makes the motor run away from its target until
+                    # cube_motion.check_arm_pos() trips 运动控制超时.
+                    legacy = 1 if int(item["command_direction"]) >= 0 else -1
+                    if legacy != direction:
+                        LOG.warning(
+                            "motor %d: ignoring command_direction=%+d which "
+                            "contradicts direction=%+d; using direction. Flip "
+                            "\"direction\" if this motor turns the wrong way.",
+                            old_id, legacy, direction)
                 cfg.motors[old_id] = MotorConfig(
                     zdt_id=int(item.get("zdt_id", old_id)),
-                    direction=1 if int(item.get("direction", 1)) >= 0 else -1,
-                    command_direction=1 if int(item.get("command_direction", item.get("direction", 1))) >= 0 else -1,
+                    direction=direction,
                     encoder_offset_counts=int(item.get("encoder_offset_counts", 0)),
                     reach_tolerance_counts=int(item.get("reach_tolerance_counts", 64)),
                     zero_motion_epsilon_counts=int(item.get("zero_motion_epsilon_counts", 8)),
@@ -333,6 +351,10 @@ class ZDTDriver:
     @staticmethod
     def frame_reboot(zdt_id: int) -> bytes:
         return bytes((zdt_id, 0x08, 0x97, ZDT_CHECKSUM))
+
+    @staticmethod
+    def frame_reset_clog_protection(zdt_id: int) -> bytes:
+        return bytes((zdt_id, 0x0E, 0x52, ZDT_CHECKSUM))
 
     def _read_expected(self, zdt_id: int, code: int, length: int,
                        timeout: Optional[float] = None,
@@ -412,6 +434,9 @@ class ZDTDriver:
 
     def reboot(self, zdt_id: int) -> None:
         self.command_ack(self.frame_reboot(zdt_id), zdt_id, 0x08)
+
+    def reset_clog_protection(self, zdt_id: int) -> None:
+        self.command_ack(self.frame_reset_clog_protection(zdt_id), zdt_id, 0x0E)
 
     def _read_cmd(self, zdt_id: int, code: int, reply_len: int) -> bytes:
         self._write(bytes((zdt_id, code, ZDT_CHECKSUM)))
@@ -545,16 +570,15 @@ class OldToZDTTranslator:
         acc = 256.0 - (20000.0 / target)
         return clamp_int(acc, 1, 255)
 
-    def _build_motion_values(self, old_id: int, m: MotionCommand) -> Tuple[int, int, int, int, int]:
-        # The old x1 is an absolute virtual encoder target. Emm FD's mode 02 is
+    def _build_motion_values(self, old_id: int, m: MotionCommand,
+                             current_old: int) -> Tuple[int, int, int, int, int]:
+        # The old x1 is an absolute virtual encoder target. Emm FD mode 0x00 is
         # relative to the motor's current realtime position, so translate the
         # absolute old target into a relative pulse move at dispatch time. This
         # avoids requiring ZDT's internal coordinate zero to match the old board.
         c = self._mcfg(old_id)
-        zpos = self.zdt.read_position_deg(c.zdt_id)
-        current_old = self._old_from_zdt_deg(old_id, zpos)
         delta_old = m.target_counts - current_old
-        signed_zdt_delta = delta_old * c.command_direction
+        signed_zdt_delta = delta_old * c.direction
         direction = 0x00 if signed_zdt_delta >= 0 else 0x01
         pulses = clamp_int(
             abs(delta_old) * max(1, c.emm_pulses_per_rev) / OLD_COUNTS_PER_REV,
@@ -567,8 +591,12 @@ class OldToZDTTranslator:
     def _send_motion(self, old_id: int, m: MotionCommand, sync: int) -> None:
         c = self._mcfg(old_id)
         r = self._runtime(old_id)
+        # Read the position ONCE: the delta that is sent to the driver and the
+        # start position recorded for completion checking must be the same
+        # sample, and every extra 115200-baud round trip delays dispatch.
         current_old = self._old_from_zdt_deg(old_id, self.zdt.read_position_deg(c.zdt_id))
-        direction, accel, speed, pulses, current = self._build_motion_values(old_id, m)
+        direction, accel, speed, pulses, current = self._build_motion_values(
+            old_id, m, current_old)
         if m.v1_rpm != 0 and not self.warned_v1:
             LOG.warning(
                 "old terminal velocity v1 is non-zero; ZDT Emm FD has no exact v1 field. "
@@ -582,7 +610,8 @@ class OldToZDTTranslator:
             self.zdt.set_closed_loop_max_current(c.zdt_id, current)
             r.last_current_ma = current
 
-        # Emm FD mode 02 = relative to current realtime position.
+        # Emm FD mode byte: 0x00 = relative, 0x01 = absolute. Relative is what
+        # the recomputed delta above needs.
         self.zdt.move_fd_emm(c.zdt_id, direction, speed, accel, pulses, 0x00, sync)
         now = time.monotonic()
         m.started_at = now
@@ -595,18 +624,24 @@ class OldToZDTTranslator:
             accel, pulses, current, sync)
 
     def _enqueue_motion_batch(self, commands: Sequence[Tuple[int, MotionCommand]]) -> None:
-        start_now: List[Tuple[int, MotionCommand]] = []
-        for old_id, m in commands:
-            r = self._runtime(old_id)
-            if r.active is None and not r.queue:
-                r.active = m
-                start_now.append((old_id, m))
-            else:
+        # A multi-motor old frame is one synchronised move. cube_motion.py uses
+        # it for the gear-coupled finger/arm pairs ([1,2] and [3,4]), where
+        # starting one motor without the other twists the jaw against the cube.
+        # So if ANY motor in the batch is still busy, queue the whole batch.
+        busy = any(self._runtime(old_id).active is not None or self._runtime(old_id).queue
+                   for old_id, _ in commands)
+        if busy:
+            for old_id, m in commands:
+                r = self._runtime(old_id)
                 r.queue.append(m)
                 LOG.debug("queued old_id=%d kind=%s depth=%d", old_id, m.kind, len(r.queue))
-
-        if not start_now:
             return
+
+        start_now: List[Tuple[int, MotionCommand]] = []
+        for old_id, m in commands:
+            self._runtime(old_id).active = m
+            start_now.append((old_id, m))
+
         sync = 1 if len(start_now) > 1 else 0
         try:
             for old_id, m in start_now:
@@ -655,23 +690,23 @@ class OldToZDTTranslator:
             self._start_next_if_any(old_id)
             return pos, state, 1 if self._runtime(old_id).active is not None else 0
 
-        reached = bool(state & 0x02) and abs(pos - m.target_counts) <= c.reach_tolerance_counts
+        within = abs(pos - m.target_counts) <= c.reach_tolerance_counts
+        reached = bool(state & 0x02) and within
         now = time.monotonic()
+
+        # Standstill tracking, shared by both command types.
+        if m.last_pos_counts is None or \
+                abs(pos - m.last_pos_counts) > c.zero_motion_epsilon_counts:
+            m.last_pos_counts = pos
+            m.last_moving_at = now
+        still_ms = (now - m.last_moving_at) * 1000.0
 
         if m.kind == "zero":
             if reached:
                 LOG.info("old ZERO reached full target without a stall, old_id=%d", old_id)
                 self._finish_active(old_id)
             else:
-                if m.last_pos_counts is None:
-                    m.last_pos_counts = pos
-                    m.last_moving_at = now
-                elif abs(pos - m.last_pos_counts) > c.zero_motion_epsilon_counts:
-                    m.last_pos_counts = pos
-                    m.last_moving_at = now
-
                 elapsed_ms = (now - m.started_at) * 1000.0
-                still_ms = (now - m.last_moving_at) * 1000.0
                 zdt_stall = bool(state & 0x04)
                 stall = (
                     elapsed_ms >= c.zero_min_run_ms and
@@ -683,14 +718,45 @@ class OldToZDTTranslator:
                         "old ZERO stall emulated old_id=%d pos=%d still=%.1fms; sending FE stop",
                         old_id, pos, still_ms)
                     self.zdt.stop(c.zdt_id, 0)
+                    # If Clog_Pro is enabled the driver latches stall protection
+                    # and disables itself, after which every later FD is
+                    # answered 0xE2 and the solve dies. The old controller had
+                    # no such latch, so clear it and re-enable.
+                    if state & 0x0C:
+                        try:
+                            self.zdt.reset_clog_protection(c.zdt_id)
+                            self.zdt.enable(c.zdt_id, True, 0)
+                            LOG.info("cleared ZDT stall protection old_id=%d", old_id)
+                        except ZDTError as e:
+                            LOG.warning("could not clear stall protection old_id=%d: %s",
+                                        old_id, e)
                     self._finish_active(old_id)
         else:
-            # The EMM in-position bit can remain set from the previous stop.
-            # Require encoder tolerance for real arm moves; only allow the bit
-            # alone for small finger moves that quantize below encoder tolerance.
-            small_move = (m.start_pos_counts is not None and
-                          abs(m.target_counts - m.start_pos_counts) <= 512)
-            if reached or (small_move and bool(state & 0x02)):
+            # The old trap_status meant "trajectory generator running", not
+            # "target reached". two_finger_clamp() grips by stalling against
+            # the cube, so it never reaches its target and a position-only test
+            # would block the caller forever. The EMM in-position bit is the
+            # equivalent status and is authoritative once the axis has stopped;
+            # the tolerance window only rejects a bit left set by the PREVIOUS
+            # move.
+            #
+            # A closed-loop driver with Clog_Pro disabled pushes against an
+            # obstruction indefinitely and never raises the in-position bit, so
+            # a long standstill alone also ends the segment. 150 ms at the
+            # slowest speed cube_motion.py commands (30 RPM = 8192 counts/s) is
+            # ~1200 counts of travel, far above zero_motion_epsilon_counts, so
+            # a slow but genuinely moving axis cannot trip it.
+            settled = still_ms >= max(30.0, float(c.zero_stall_ms) / 2.0)
+            if reached or (bool(state & 0x02) and settled) or still_ms >= 150.0:
+                if not within:
+                    LOG.debug("old_id=%d stopped %d counts short of %d",
+                              old_id, m.target_counts - pos, m.target_counts)
+                self._finish_active(old_id)
+            elif not (state & 0x01):
+                # The driver disabled itself mid-move (stall protection). The
+                # old controller had no such latch; do not hang the caller.
+                LOG.error("old_id=%d disabled mid-move at %d (target %d)",
+                          old_id, pos, m.target_counts)
                 self._finish_active(old_id)
 
         r = self._runtime(old_id)
@@ -976,8 +1042,21 @@ def self_test() -> None:
     assert OldToZDTTranslator._accel_emm(100) == 254
     ma = ZDTDriver.frame_closed_loop_max_current(1, 500, 0)
     assert ma == bytes.fromhex("01 45 66 00 01 f4 6b")
-    fd = ZDTDriver.frame_fd_emm(1, 0, 500, 254, 3200, 2, 0)
-    assert fd == bytes.fromhex("01 fd 00 01 f4 fe 00 00 0c 80 02 00 6b")
+    # Mode 0x00 = relative, which is what _send_motion actually issues.
+    fd = ZDTDriver.frame_fd_emm(1, 0, 500, 254, 3200, 0x00, 0)
+    assert fd == bytes.fromhex("01 fd 00 01 f4 fe 00 00 0c 80 00 00 6b")
+    assert ZDTDriver.frame_reset_clog_protection(2) == bytes.fromhex("02 0e 52 6b")
+
+    # Feedback sign and command sign must agree, otherwise a move can never
+    # converge on its target.
+    conflicting = {"motors": {"2": {"zdt_id": 1, "direction": -1,
+                                    "command_direction": 1}}}
+    tmp = Path("/tmp/_old2zdt_selftest_cfg.json")
+    tmp.write_text(json.dumps(conflicting), encoding="utf-8")
+    try:
+        assert BridgeConfig.load(str(tmp)).motors[2].direction == -1
+    finally:
+        tmp.unlink()
 
     print("self-test OK")
     print("old TRAP example -> Emm current-limit approximation + FD move:")

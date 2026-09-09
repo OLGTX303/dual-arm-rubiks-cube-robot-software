@@ -12,8 +12,7 @@
       "zero_stall_ms": 80,
       "zero_min_run_ms": 80,
       "zero_use_zdt_stall_flag": false,
-      "emm_pulses_per_rev": 3200,
-      "command_direction": -1
+      "emm_pulses_per_rev": 3200
     },
     "2": {
       "zdt_id": 1,
@@ -24,8 +23,7 @@
       "zero_stall_ms": 80,
       "zero_min_run_ms": 80,
       "zero_use_zdt_stall_flag": false,
-      "emm_pulses_per_rev": 3200,
-      "command_direction": 1
+      "emm_pulses_per_rev": 3200
     },
     "3": {
       "zdt_id": 4,
