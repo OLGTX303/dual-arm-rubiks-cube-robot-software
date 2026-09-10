@@ -395,9 +395,9 @@ class MotionCtrl:
         self.finger_offset[0] = target
         self.finger_offset[1] = target
         # 手臂目标位置 = arm_zero + arm_offset
-        # 手指目标位置 = finger_zero + arm_offset / 2 + finger_offset
-        finger1 = self.finger_zero[0] + self.arm_offset[0] // 2 + self.finger_offset[0]
-        finger3 = self.finger_zero[1] + self.arm_offset[1] // 2 + self.finger_offset[1]
+        # Calibrated arm/finger signs make physical arm and finger rotation agree.
+        finger1 = self.finger_zero[0] - self.arm_offset[0] // 2 + self.finger_offset[0]
+        finger3 = self.finger_zero[1] - self.arm_offset[1] // 2 + self.finger_offset[1]
         cmd_trap(self.ser, [1, 3], False, 
                  [[finger1, 0, V_FINGER, A_FINGER, current], 
                   [finger3, 0, V_FINGER, A_FINGER, current]])
@@ -431,9 +431,9 @@ class MotionCtrl:
         # 手臂目标位置 = arm_zero + arm_offset
         arm_target = self.arm_zero[index] + self.arm_offset[index]
         # 存在齿轮，所以需要和手臂电机旋转方向相反，转速绝对值相同，才能保证相对静止
-        # 手指目标位置 = finger_zero + arm_offset / 2 + finger_offset
+        # Calibrated arm/finger signs make physical arm and finger rotation agree.
         # 计算手指电机的目标位置
-        finger_target = self.finger_zero[index] + self.arm_offset[index] // 2 + self.finger_offset[index]
+        finger_target = self.finger_zero[index] - self.arm_offset[index] // 2 + self.finger_offset[index]
 
         cmd_trap(self.ser, id_list, False, 
                  [[finger_target, 0, speed, accel, finger_current], 
@@ -496,12 +496,12 @@ class MotionCtrl:
             return
 
         # 手指电机目前位置
-        finger_now = self.finger_zero[index] + self.arm_offset[index] // 2 + self.finger_offset[index]
+        finger_now = self.finger_zero[index] - self.arm_offset[index] // 2 + self.finger_offset[index]
         # 计算函数返回时的电机位置
-        finger_ret = self.finger_zero[index] + self.arm_offset[index] // 2 + wait
+        finger_ret = self.finger_zero[index] - self.arm_offset[index] // 2 + wait
         # 计算手指电机的目标位置
         self.finger_offset[index] = pos
-        finger_target = self.finger_zero[index] + self.arm_offset[index] // 2 + self.finger_offset[index]
+        finger_target = self.finger_zero[index] - self.arm_offset[index] // 2 + self.finger_offset[index]
         cmd_trap(self.ser, id_list, False, [[finger_target, 0, speed, accel, current]])
         if wait == 0:
             cmd_wait_motion(self.ser, id_list[0])
@@ -530,21 +530,21 @@ class MotionCtrl:
         if self.finger_offset[index] != FINGER_INIT:
             logger.warning("finger_offset[index] != FINGER_INIT")
         # 手指电机目前位置
-        finger_now    = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_INIT
+        finger_now    = self.finger_zero[index] - self.arm_offset[index] // 2 + FINGER_INIT
         # 计算函数返回时的电机位置
-        finger_ret    = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_NO_LOAD_START_ARM
+        finger_ret    = self.finger_zero[index] - self.arm_offset[index] // 2 + FINGER_NO_LOAD_START_ARM
         # 计算手指电机的目标位置
         arm_90_deg = round(8192 / 2)
         arm_20_deg = round(8192 * (20/90) / 2)
         arm_70_deg = round(8192 * (70/90) / 2)
 
         if no_finger_return == False:
-            finger_target_stage_1 = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_MAX
-            finger_target_stage_1 += arm_20_deg
-            finger_target_stage_2 = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_MAX
-            finger_target_stage_2 += arm_70_deg
-            finger_target_stage_3 = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_INIT
-            finger_target_stage_3 += arm_90_deg
+            finger_target_stage_1 = self.finger_zero[index] - self.arm_offset[index] // 2 + FINGER_MAX
+            finger_target_stage_1 -= arm_20_deg
+            finger_target_stage_2 = self.finger_zero[index] - self.arm_offset[index] // 2 + FINGER_MAX
+            finger_target_stage_2 -= arm_70_deg
+            finger_target_stage_3 = self.finger_zero[index] - self.arm_offset[index] // 2 + FINGER_INIT
+            finger_target_stage_3 -= arm_90_deg
             
             cmd_trap(self.ser, id_list, False, 
                     [[finger_target_stage_1, V_NO_LOAD_20_70_DEG//2, V_FINGER, A_FINGER, MAX_CURRENT]])
@@ -553,10 +553,10 @@ class MotionCtrl:
             cmd_trap(self.ser, id_list, False, 
                     [[finger_target_stage_3, 0                     , V_FINGER, A_FINGER, MAX_CURRENT]])
         else:
-            finger_target_stage_1 = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_MAX
-            finger_target_stage_1 += arm_20_deg
-            finger_target_stage_2 = self.finger_zero[index] + self.arm_offset[index] // 2 + FINGER_MAX
-            finger_target_stage_2 += arm_90_deg
+            finger_target_stage_1 = self.finger_zero[index] - self.arm_offset[index] // 2 + FINGER_MAX
+            finger_target_stage_1 -= arm_20_deg
+            finger_target_stage_2 = self.finger_zero[index] - self.arm_offset[index] // 2 + FINGER_MAX
+            finger_target_stage_2 -= arm_90_deg
             self.finger_offset[index] = FINGER_MAX
 
             cmd_trap(self.ser, id_list, False, 
