@@ -5,7 +5,7 @@
   "motors": {
     "1": {
       "zdt_id": 2,
-      "direction": -1,
+      "direction": 1,
       "command_direction": 1,
       "encoder_offset_counts": 0,
       "reach_tolerance_counts": 64,
@@ -29,7 +29,7 @@
     },
     "3": {
       "zdt_id": 4,
-      "direction": -1,
+      "direction": 1,
       "command_direction": 1,
       "encoder_offset_counts": 0,
       "reach_tolerance_counts": 64,
