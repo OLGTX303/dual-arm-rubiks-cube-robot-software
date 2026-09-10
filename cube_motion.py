@@ -433,7 +433,7 @@ class MotionCtrl:
         # 存在齿轮，所以需要和手臂电机旋转方向相反，转速绝对值相同，才能保证相对静止
         # Calibrated arm/finger signs make physical arm and finger rotation agree.
         # 计算手指电机的目标位置
-        finger_target = self.finger_zero[index] - self.arm_offset[index] // 2 + self.finger_offset[index]
+        finger_target = self.finger_zero[index] + self.arm_offset[index] // 2 + self.finger_offset[index]
 
         cmd_trap(self.ser, id_list, False, 
                  [[finger_target, 0, speed, accel, finger_current], 
