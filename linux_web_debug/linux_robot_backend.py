@@ -61,7 +61,7 @@ def motor_status_message():
 def colors_message():
     return 'colors:'+','.join(['0','0','128']*54)+'U'*54
 
-def run_motion_sequence(mc, seq):
+def run_motion_sequence(mc, seq, finish_finger_flip=False):
     """Run original parser units intact; +N is a 2/3-token compound motion."""
     i = 0
     while i < len(seq):
@@ -73,7 +73,11 @@ def run_motion_sequence(mc, seq):
             if len(seq[i + 1]) >= 2 and seq[i + 1][1:] == '+N':
                 n = 3 if i + 2 < len(seq) else 2
         state['status'] = f'STEP {i + 1}/{len(seq)} {" ".join(seq[i:i+n])}'
-        mc.motions(seq[i:i+n])
+        step = seq[i:i+n]
+        if finish_finger_flip and n == 1 and token[1:] == '1':
+            mc.move_finger_flip(token[0] == 'L', 0)
+        else:
+            mc.motions(step)
         i += n
 
 class HTTPHandler(BaseHTTPRequestHandler):
@@ -129,7 +133,7 @@ def do_hw(cmd):
                     p=[legacy.cmd_get_pos(s,i) for i in range(1,5)]
                     if any(x is None for x in p): raise RuntimeError('motor position read failed')
                     legacy.cmd_enable(s,[1,2,3,4],True); mc=legacy.MotionCtrl(s,*p)
-                    run_motion_sequence(mc, seq)
+                    run_motion_sequence(mc, seq, finish_finger_flip=True)
                     result=True
                 elif cmd.startswith('scramble:'):
                     seq=cmd.split(':',1)[1].strip().split(); p=legacy.cmd_zero(s)
